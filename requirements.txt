@@ -1,0 +1,21 @@
+# Core dependencies — needed for standalone mode (and server mode too).
+# These all have prebuilt wheels for every actively supported Python version,
+# so `run.bat`/`run.sh` installing just this file always works, regardless
+# of how new your Python install is.
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-Migrate==4.0.7
+Flask-Login==0.6.3
+openpyxl==3.1.5
+reportlab==4.2.5
+python-dateutil==2.9.0.post0
+Pillow>=10.0.0
+waitress==3.0.0
+pypdfium2>=4.30.0
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+
+# Server mode's PostgreSQL driver is intentionally NOT listed here — see
+# requirements-server.txt. It's only needed if you actually connect to
+# Postgres or build the distributable installer (build_exe.bat installs
+# both files so the shipped .exe supports server mode too).

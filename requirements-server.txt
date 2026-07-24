@@ -1,0 +1,15 @@
+# PostgreSQL driver — only needed to actually run in Server mode, or when
+# building the distributable installer (which needs to support server mode
+# out of the box for whoever it's handed to).
+#
+# Not needed just to preview/run the app standalone — run.bat/run.sh
+# deliberately don't install this file, so a local preview never fails
+# here even if this machine's Python version doesn't have a prebuilt wheel
+# for it yet (psycopg2-binary lags a few months behind new Python releases;
+# if `pip install -r requirements-server.txt` fails with a "pg_config not
+# found" / "Microsoft Visual C++ 14.0 required" error, it means this
+# Python version is too new for the psycopg2-binary release currently on
+# PyPI — use a slightly older Python (3.11/3.12) on the machine you build
+# the installer on, or check https://pypi.org/project/psycopg2-binary/ for
+# a newer release that has since added a wheel for your version).
+psycopg2-binary>=2.9.9
