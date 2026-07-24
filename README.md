@@ -115,7 +115,7 @@ True live bank sync (like Plaid, which powers apps like DoorLoop and Rocket Mone
 
 ## 📝 A note on PDF import and OCR
 
-Digital PDF statements (the normal kind your bank lets you download, where you can select/copy the text) import out of the box. A scanned or photographed statement needs OCR, which requires [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) installed separately on the machine running the app — a well-known, free, open-source OCR engine, but a system-level install, not something bundled invisibly. If Tesseract isn't installed, the app says so plainly instead of failing silently. OCR is never perfectly accurate — always check extracted rows against the original statement before importing.
+Digital PDF statements (the normal kind your bank lets you download, where you can select/copy the text) import out of the box. A scanned or photographed statement needs OCR, which requires [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) — a well-known, free, open-source OCR engine. By default this is a separate system-level install on the machine running the app; if it isn't installed, the app says so plainly instead of failing silently. If you're building your own installer to hand out, you can optionally bundle Tesseract right into it instead (see "BUILDING TESSERACT OCR INTO THE APP ITSELF" in `BUILD INSTRUCTIONS.txt`) so it works for whoever you give it to with nothing extra for them to install. OCR is never perfectly accurate — always check extracted rows against the original statement before importing.
 
 ---
 

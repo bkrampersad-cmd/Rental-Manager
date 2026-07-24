@@ -29,6 +29,23 @@ echo Cleaning previous build...
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
 
+REM Optional bundled Tesseract OCR: if you installed Tesseract once and
+REM copied its Program Files\Tesseract-OCR folder into this project as
+REM tesseract-bin\ (see BUILD INSTRUCTIONS.txt), it gets folded into the
+REM build automatically here so people you hand the installer to don't need
+REM to install Tesseract separately. If tesseract-bin\ isn't present, this
+REM is skipped and OCR falls back to a separate system-wide Tesseract
+REM install on the machine running the app, exactly as before.
+set TESSERACT_FLAG=
+if exist "tesseract-bin\tesseract.exe" (
+    echo Found tesseract-bin\ - bundling Tesseract OCR into this build.
+    set TESSERACT_FLAG=--add-data "tesseract-bin;tesseract-bin"
+) else (
+    echo No tesseract-bin\ folder found - OCR will rely on a separate
+    echo Tesseract install on the machine running the app ^(see BUILD
+    echo INSTRUCTIONS.txt if you'd like to bundle it instead^).
+)
+
 echo Building RentalManager.exe...
 pyinstaller --noconfirm --name RentalManager ^
     --icon "assets\app_icon.ico" ^
@@ -37,6 +54,7 @@ pyinstaller --noconfirm --name RentalManager ^
     --add-data "LICENSE;." ^
     --add-data "migrations;migrations" ^
     --hidden-import "logging.config" ^
+    %TESSERACT_FLAG% ^
     launcher.py
 
 echo.

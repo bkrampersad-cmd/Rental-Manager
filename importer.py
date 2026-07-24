@@ -18,9 +18,84 @@ double-check anything that came from an OCR'd page before importing it.
 import csv
 import hashlib
 import io
+import os
 import re
+import sys
 
 from dateutil import parser as date_parser
+
+# ---------------------------------------------------------------------------
+# Optional bundled Tesseract OCR — if a tesseract-bin\ folder was placed next
+# to the app (see BUILD INSTRUCTIONS.txt: install Tesseract once, copy its
+# Program Files\Tesseract-OCR folder in as tesseract-bin\ before running
+# build_exe.bat), point pytesseract straight at those binaries instead of
+# relying on a separate system-wide install. Entirely optional — if that
+# folder isn't there, this is a no-op and OCR behaves exactly as it always
+# has (pytesseract falls back to whatever "tesseract" resolves to on PATH).
+# ---------------------------------------------------------------------------
+_IS_FROZEN = getattr(sys, "frozen", False)
+if _IS_FROZEN:
+    _RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+else:
+    _RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_BUNDLED_TESSERACT_DIR = os.path.join(_RESOURCE_DIR, "tesseract-bin")
+_BUNDLED_TESSERACT_EXE = os.path.join(_BUNDLED_TESSERACT_DIR, "tesseract.exe")
+_tesseract_bundle_checked = False
+
+
+def _configure_bundled_tesseract():
+    """One-time check, safe to call repeatedly. Wires pytesseract up to the
+    bundled binary + tessdata if present, then actually confirms it runs
+    (not just that the file exists) before committing to it — if the
+    bundle turns out to be broken (missing a DLL, wrong architecture,
+    incomplete copy), this falls back to plain "tesseract" so a separate
+    system-wide install still gets a chance, exactly like if there'd been
+    no bundle at all. If neither works, OCR just degrades gracefully
+    later (see _ocr_page_text) same as it always has."""
+    global _tesseract_bundle_checked
+    if _tesseract_bundle_checked:
+        return
+    _tesseract_bundle_checked = True
+    if not os.path.isfile(_BUNDLED_TESSERACT_EXE):
+        return
+    try:
+        import pytesseract
+    except ImportError:
+        return
+    pytesseract.pytesseract.tesseract_cmd = _BUNDLED_TESSERACT_EXE
+    tessdata_dir = os.path.join(_BUNDLED_TESSERACT_DIR, "tessdata")
+    if os.path.isdir(tessdata_dir):
+        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+    try:
+        pytesseract.get_tesseract_version()  # confirms the bundle actually runs
+    except Exception:
+        pytesseract.pytesseract.tesseract_cmd = "tesseract"
+        os.environ.pop("TESSDATA_PREFIX", None)
+
+
+def get_ocr_status():
+    """Small diagnostic used by Settings so you can confirm OCR is actually
+    working (and whether it's using the tesseract-bin\\ bundle or a
+    separate system-wide install) without needing a real scanned PDF on
+    hand to test with. Actually invokes the Tesseract binary (not just a
+    file-existence check), so a bundle that's missing a DLL or otherwise
+    broken shows up here rather than only failing later on a real import."""
+    try:
+        import pytesseract
+    except ImportError:
+        return {"available": False, "source": None, "version": None,
+                 "error": "The pytesseract Python package isn't installed."}
+
+    _configure_bundled_tesseract()
+    source = "bundled" if pytesseract.pytesseract.tesseract_cmd == _BUNDLED_TESSERACT_EXE else "system"
+
+    try:
+        version = str(pytesseract.get_tesseract_version())
+    except Exception as exc:
+        return {"available": False, "source": source, "version": None, "error": str(exc)}
+
+    return {"available": True, "source": source, "version": version, "error": None}
 
 CANDIDATE_DATE_HEADERS = ["date", "transaction date", "posting date", "posted date"]
 CANDIDATE_DESC_HEADERS = ["description", "memo", "payee", "name", "details"]
@@ -355,6 +430,8 @@ def _ocr_page_text(pdfium_page, dpi=250):
         import pytesseract
     except ImportError:
         return None  # OCR libraries not installed at all
+
+    _configure_bundled_tesseract()
 
     try:
         scale = dpi / 72  # pypdfium2 renders at 72 dpi by default; scale up for OCR quality

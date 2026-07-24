@@ -63,7 +63,7 @@ from models import (
     SCHEDULE_E_NOT_DEDUCTIBLE,
     SCHEDULE_E_CAPITALIZE,
 )
-from importer import sniff_file, build_transactions
+from importer import sniff_file, build_transactions, get_ocr_status
 import exports as export_lib
 import tax_report as tax_lib
 from config import (
@@ -2026,6 +2026,15 @@ def _prune_stale_import_sessions():
     cutoff = datetime.utcnow() - IMPORT_SESSION_TTL
     ImportSession.query.filter(ImportSession.created_at < cutoff).delete()
     db.session.commit()
+
+
+@app.route("/api/import/ocr-status", methods=["GET"])
+def import_ocr_status():
+    """Lets Settings/Import show whether scanned-PDF OCR is actually
+    working right now, and whether it's using the tesseract-bin\\ bundle
+    or a separate system-wide Tesseract install — see get_ocr_status() in
+    importer.py for what it actually checks."""
+    return jsonify(get_ocr_status())
 
 
 @app.route("/api/import/preview", methods=["POST"])

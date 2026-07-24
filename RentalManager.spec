@@ -5,7 +5,7 @@ a = Analysis(
     ['launcher.py'],
     pathex=[],
     binaries=[],
-    datas=[('templates', 'templates'), ('static', 'static'), ('LICENSE', '.'), ('migrations', 'migrations')],
+    datas=[('templates', 'templates'), ('static', 'static'), ('LICENSE', '.'), ('migrations', 'migrations'), ('tesseract-bin', 'tesseract-bin')],
     hiddenimports=['logging.config'],
     hookspath=[],
     hooksconfig={},
