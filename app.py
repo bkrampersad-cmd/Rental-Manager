@@ -15,6 +15,8 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
+import time
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
@@ -83,10 +85,21 @@ else:
 
 DB_PATH = os.path.join(DATA_DIR, "rental_manager.db")
 
+# Where scheduled automatic backups are written — literally "a Backup folder
+# in the app's own directory" (next to RentalManager.exe / app.py), not
+# tucked away in DATA_DIR, so it's easy to find in Explorer. RESOURCE_DIR is
+# writable here even in a packaged install: PyInstaller's --onedir layout
+# puts it under the user's own LocalAppData\Programs (see installer.iss —
+# PrivilegesRequired=lowest), not the real (UAC-protected) Program Files.
+# Uninstalling only removes files the installer itself put there, so this
+# folder and its contents are left behind rather than deleted.
+BACKUP_DIR = os.path.join(RESOURCE_DIR, "Backup")
+
 # Config decides SQLite-standalone vs. Postgres-server before the Flask app
 # or database engine exist. Absent any config.json, this is a no-op that
 # reproduces exactly today's standalone behavior.
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
 APP_CONFIG = load_config(DATA_DIR)
 APP_MODE = APP_CONFIG["mode"]
 
@@ -2479,6 +2492,10 @@ def get_settings():
     s["access_security_questions_configured"] = bool(
         s.get("access_security_q1") and s.get("access_security_q2") and s.get("access_security_q3")
     )
+    # Read-only, derived — not stored as Settings rows themselves.
+    s["backup_folder_path"] = BACKUP_DIR
+    last_auto = _last_auto_backup_at()
+    s["backup_auto_last_run_at"] = last_auto.isoformat() if last_auto else None
     for key in SENSITIVE_SETTING_KEYS:
         s.pop(key, None)
     return jsonify(s)
@@ -2491,6 +2508,10 @@ def update_settings():
     for key, value in data.items():
         if key in SENSITIVE_SETTING_KEYS:
             continue
+        if key == "backup_auto_frequency" and value not in ("", "weekly", "30days"):
+            continue
+        if key == "backup_auto_retention":
+            value = str(_clamp_backup_retention(value))
         _set_setting(key, value)
     return jsonify({"ok": True})
 
@@ -3007,9 +3028,12 @@ def import_profile_backup():
     return jsonify({"ok": True, "settings": _settings_map()})
 
 
-@app.route("/api/backup/full/export", methods=["GET"])
-@require_role(ROLE_ADMIN, ROLE_EDITOR)
-def export_full_backup():
+def _build_full_backup_bytes():
+    """Builds a Full Backup .zip (server-mode JSON export or standalone
+    SQLite file, whichever this install is) and returns it as an in-memory
+    BytesIO, positioned at the start and ready to read. Shared by the manual
+    browser-download route below and the scheduled/on-demand auto-backup
+    routine — same file format either way, just a different destination."""
     db.session.commit()
     buf = io.BytesIO()
 
@@ -3035,32 +3059,36 @@ def export_full_backup():
             _zip_write_documents(zf)
 
     buf.seek(0)
+    return buf
+
+
+@app.route("/api/backup/full/export", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def export_full_backup():
+    buf = _build_full_backup_bytes()
     db.session.add(BackupLog(backup_type="full", created_by=_current_username()))
     db.session.commit()
     return send_file(buf, mimetype="application/zip", as_attachment=True,
                       download_name=f"rental_manager_full_backup_{date.today().isoformat()}.zip")
 
 
-@app.route("/api/backup/full/import", methods=["POST"])
-@require_role(ROLE_ADMIN)
-def import_full_backup():
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "No file uploaded"}), 400
-
+def _restore_full_backup_from_fileobj(file_obj):
+    """Restores a Full Backup .zip from any file-like object (an uploaded
+    Werkzeug FileStorage, or a plain open()'d file from the Backup folder —
+    both support the .read()/seek() zipfile needs). Returns (ok, error,
+    status_code); error/status_code are only meaningful when ok is False.
+    Shared by the browser-upload route and the restore-from-folder route."""
     if is_server_mode(APP_CONFIG):
         try:
-            with zipfile.ZipFile(file) as zf:
+            with zipfile.ZipFile(file_obj) as zf:
                 if "backup.json" not in zf.namelist():
-                    return jsonify({
-                        "error": "That looks like a standalone (SQLite) backup file, not a "
-                                 "server-mode backup. The two formats aren't interchangeable."
-                    }), 400
+                    return False, ("That looks like a standalone (SQLite) backup file, not a "
+                                   "server-mode backup. The two formats aren't interchangeable."), 400
                 payload = json.loads(zf.read("backup.json").decode("utf-8"))
                 try:
                     _import_server_backup_json(payload)
                 except ValueError as exc:
-                    return jsonify({"error": str(exc)}), 400
+                    return False, str(exc), 400
                 for fname in LOGO_FILENAMES:
                     dest = os.path.join(DATA_DIR, fname)
                     if fname in zf.namelist():
@@ -3074,21 +3102,19 @@ def import_full_backup():
                 _zip_restore_receipts(zf)
                 _zip_restore_documents(zf)
         except zipfile.BadZipFile:
-            return jsonify({"error": "That file isn't a valid .zip export"}), 400
-        return jsonify({"ok": True})
+            return False, "That file isn't a valid .zip export", 400
+        return True, None, None
 
     # Standalone mode — original SQLite-file-swap approach.
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp_path = os.path.join(DATA_DIR, "_restore_tmp.db")
     try:
-        with zipfile.ZipFile(file) as zf:
+        with zipfile.ZipFile(file_obj) as zf:
             if "rental_manager.db" not in zf.namelist():
                 if "backup.json" in zf.namelist():
-                    return jsonify({
-                        "error": "That looks like a server-mode backup file, not a standalone "
-                                 "(SQLite) backup. The two formats aren't interchangeable."
-                    }), 400
-                return jsonify({"error": "That doesn't look like a full backup file"}), 400
+                    return False, ("That looks like a server-mode backup file, not a standalone "
+                                   "(SQLite) backup. The two formats aren't interchangeable."), 400
+                return False, "That doesn't look like a full backup file", 400
 
             with open(tmp_path, "wb") as f:
                 f.write(zf.read("rental_manager.db"))
@@ -3101,7 +3127,7 @@ def import_full_backup():
                 test_conn.close()
             required = {"properties", "transactions", "categories", "settings"}
             if not required.issubset(tables):
-                return jsonify({"error": "That file doesn't look like a Rental Manager backup"}), 400
+                return False, "That file doesn't look like a Rental Manager backup", 400
 
             db.session.remove()
             db.engine.dispose()
@@ -3127,7 +3153,7 @@ def import_full_backup():
             _zip_restore_receipts(zf)
             _zip_restore_documents(zf)
     except zipfile.BadZipFile:
-        return jsonify({"error": "That file isn't a valid .zip export"}), 400
+        return False, "That file isn't a valid .zip export", 400
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -3138,6 +3164,198 @@ def import_full_backup():
     with app.app_context():
         db.create_all()  # no-op if schema already matches; guards against restoring an older backup
 
+    return True, None, None
+
+
+@app.route("/api/backup/full/import", methods=["POST"])
+@require_role(ROLE_ADMIN)
+def import_full_backup():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "No file uploaded"}), 400
+    ok, error, status = _restore_full_backup_from_fileobj(file)
+    if not ok:
+        return jsonify({"error": error}), status
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Scheduled automatic backups — writes a Full Backup .zip straight into
+# BACKUP_DIR on a Weekly or Every-30-Days cadence, on top of (never instead
+# of) the manual Export/Import buttons above. Retention is capped at 30
+# files, oldest deleted first — never unlimited. Off by default
+# (backup_auto_frequency == "").
+# ---------------------------------------------------------------------------
+
+BACKUP_AUTO_FREQUENCIES = {"weekly": 7, "30days": 30}
+BACKUP_AUTO_RETENTION_MAX = 30
+BACKUP_AUTO_FILE_PREFIX = "rental_manager_auto_backup_"
+
+
+def _clamp_backup_retention(raw):
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 10
+    return max(1, min(BACKUP_AUTO_RETENTION_MAX, n))
+
+
+def _last_auto_backup_at():
+    row = (
+        BackupLog.query
+        .filter_by(backup_type="auto")
+        .order_by(BackupLog.created_at.desc())
+        .first()
+    )
+    return row.created_at if row else None
+
+
+def _auto_backup_files():
+    """Existing auto-backup .zip files in BACKUP_DIR, oldest first."""
+    try:
+        names = [f for f in os.listdir(BACKUP_DIR)
+                 if f.startswith(BACKUP_AUTO_FILE_PREFIX) and f.endswith(".zip")]
+    except OSError:
+        return []
+    paths = [os.path.join(BACKUP_DIR, n) for n in names]
+    paths.sort(key=lambda p: os.path.getmtime(p))
+    return paths
+
+
+def _create_auto_backup():
+    """Writes a fresh auto-backup .zip into BACKUP_DIR, enforces retention
+    (deletes the oldest file(s) once the configured cap is exceeded), and
+    logs a BackupLog row. Called both by the scheduler when a backup is due
+    and directly by the "Back Up Now" button (which always runs regardless
+    of whether one is technically due yet)."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    buf = _build_full_backup_bytes()
+    stamp = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"{BACKUP_AUTO_FILE_PREFIX}{stamp}.zip")
+    with open(dest, "wb") as f:
+        f.write(buf.read())
+
+    retention = _clamp_backup_retention(_settings_map().get("backup_auto_retention"))
+    existing = _auto_backup_files()
+    while len(existing) > retention:
+        oldest = existing.pop(0)
+        try:
+            os.remove(oldest)
+        except OSError:
+            pass
+
+    db.session.add(BackupLog(backup_type="auto", created_by=None))
+    db.session.commit()
+    return dest
+
+
+def _run_auto_backup_if_due():
+    settings_map = _settings_map()
+    frequency = settings_map.get("backup_auto_frequency") or ""
+    interval_days = BACKUP_AUTO_FREQUENCIES.get(frequency)
+    if not interval_days:
+        return  # feature is off
+
+    last = _last_auto_backup_at()
+    if last is not None:
+        days_since = (datetime.utcnow() - last).total_seconds() / 86400
+        if days_since < interval_days:
+            return  # not due yet
+
+    _create_auto_backup()
+
+
+_backup_scheduler_started = False
+
+
+def _backup_scheduler_loop():
+    # Give the app a little time to finish booting/migrating before the
+    # first check.
+    time.sleep(15)
+    while True:
+        try:
+            with app.app_context():
+                _run_auto_backup_if_due()
+        except Exception:
+            app.logger.exception("Scheduled auto-backup check failed")
+        time.sleep(6 * 3600)  # re-check every 6 hours — cheap, and catches
+                               # up quickly if the app wasn't running when a
+                               # backup was originally due
+
+
+def _start_backup_scheduler():
+    global _backup_scheduler_started
+    if _backup_scheduler_started:
+        return
+    # Avoid a duplicate thread from Flask's debug-mode reloader parent
+    # process (irrelevant once packaged — the frozen exe never sets
+    # app.debug — but keeps `python app.py` well-behaved too).
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+    _backup_scheduler_started = True
+    threading.Thread(target=_backup_scheduler_loop, daemon=True).start()
+
+
+_start_backup_scheduler()
+
+
+@app.route("/api/backup/auto/run-now", methods=["POST"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def run_auto_backup_now():
+    path = _create_auto_backup()
+    return jsonify({"ok": True, "filename": os.path.basename(path)})
+
+
+@app.route("/api/backup/auto/list", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def list_auto_backups():
+    files = []
+    for path in reversed(_auto_backup_files()):  # newest first
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        files.append({
+            "filename": os.path.basename(path),
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat(),
+        })
+    return jsonify({"folder": BACKUP_DIR, "files": files})
+
+
+@app.route("/api/backup/auto/open-folder", methods=["POST"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def open_auto_backup_folder():
+    """Opens the Backup folder in Explorer — only meaningful on the same
+    Windows machine the app is running on (which is always true for this
+    desktop-style local app), a no-op elsewhere."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if sys.platform == "win32":
+        try:
+            os.startfile(BACKUP_DIR)  # noqa: S606 — local desktop app, own data folder
+        except OSError:
+            pass
+    return jsonify({"ok": True, "folder": BACKUP_DIR})
+
+
+@app.route("/api/backup/auto/restore", methods=["POST"])
+@require_role(ROLE_ADMIN)
+def restore_auto_backup():
+    data = request.get_json(force=True) or {}
+    filename = data.get("filename") or ""
+    # Reject anything that isn't a bare filename — no path traversal via
+    # "../", no absolute paths. Restoring is only ever "pick one of the
+    # files already listed from BACKUP_DIR", never an arbitrary path.
+    if not filename or os.path.basename(filename) != filename:
+        return jsonify({"error": "Invalid filename"}), 400
+    path = os.path.join(BACKUP_DIR, filename)
+    if not os.path.isfile(path):
+        return jsonify({"error": "That backup file no longer exists"}), 404
+
+    with open(path, "rb") as f:
+        ok, error, status = _restore_full_backup_from_fileobj(f)
+    if not ok:
+        return jsonify({"error": error}), status
     return jsonify({"ok": True})
 
 
@@ -3159,9 +3377,12 @@ MIN_DAYS_BETWEEN_BACKUP_AND_RESET = 5
 
 
 def _last_full_backup_at():
+    # "auto" (scheduled) backups count exactly the same as a manual "full"
+    # export for this purpose — both are a complete, restorable copy of
+    # everything, just triggered differently.
     row = (
         BackupLog.query
-        .filter_by(backup_type="full")
+        .filter(BackupLog.backup_type.in_(("full", "auto")))
         .order_by(BackupLog.created_at.desc())
         .first()
     )

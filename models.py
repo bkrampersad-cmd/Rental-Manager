@@ -722,6 +722,14 @@ DEFAULT_SETTINGS = {
     # internal Setting rows — see SENSITIVE_SETTING_KEYS in app.py — not
     # part of this default map, same as access_password_hash itself.)
     "access_password_lockout_attempts": "",
+    # Scheduled automatic backups — a Full Backup .zip written straight to a
+    # "Backup" folder next to the app (see BACKUP_DIR in app.py), on top of
+    # (not instead of) the manual Export/Import buttons. Blank frequency
+    # means the feature is off. Retention is capped at 30 files — see
+    # _clamp_backup_retention() in app.py — oldest file is deleted first
+    # once that cap is hit, never unlimited.
+    "backup_auto_frequency": "",       # "" (off) | "weekly" | "30days"
+    "backup_auto_retention": "10",     # how many auto-backup .zip files to keep, 1-30
 }
 
 # Historical + current IRS standard business mileage rates, (effective_date,

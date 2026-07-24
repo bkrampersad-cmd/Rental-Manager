@@ -89,6 +89,7 @@ See [Setup](#-setup) below for running from source instead, or the PDF guide for
 - **Optional lockout** — after a configurable number of wrong guesses (password or security answers), the app locks out further attempts for 15 minutes.
 - **Danger Zone reset options**, gated behind a recent Full Backup and (in Network mode) Admin role — **Reset Data Only** or a complete **Full Factory Reset**, each requiring you to type `DELETE` to confirm.
 - **Backup & Restore** — export just your business profile (branding, no data) or a full backup (everything) as a `.zip`, with every backup logged so the reset gate always knows how current it is.
+- **Automatic Backups** — optional Weekly or Every-30-Days schedule that writes a Full Backup straight into a `Backup` folder next to the app, keeping up to 30 files (oldest deleted first) and restorable with one click.
 - **Accounts & roles (Network mode)** — Admin / Editor / Viewer logins, with transactions recording who entered them.
 
 ---
