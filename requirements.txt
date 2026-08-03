@@ -15,6 +15,13 @@ pypdfium2>=4.30.0
 pdfplumber>=0.11.0
 pytesseract>=0.3.10
 
+# Outlook email auto-import monitor (Settings > Email Auto-Import) talks to
+# Outlook over Windows COM/MAPI — only installable on Windows, and only
+# actually used there. The `sys_platform` marker means `pip install -r
+# requirements.txt` still works fine on a non-Windows machine (pip just
+# skips this line) even though the app itself only ships for Windows.
+pywin32>=306; sys_platform == "win32"
+
 # Server mode's PostgreSQL driver is intentionally NOT listed here — see
 # requirements-server.txt. It's only needed if you actually connect to
 # Postgres or build the distributable installer (build_exe.bat installs

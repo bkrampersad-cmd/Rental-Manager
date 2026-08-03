@@ -192,6 +192,12 @@ class Transaction(db.Model):
     notes = db.Column(db.Text)
     source = db.Column(db.String(20), default="manual")  # manual | import
     import_hash = db.Column(db.String(64), index=True)  # for de-duping imports
+    # Set only for rows created by the Outlook email auto-import monitor —
+    # links back to the EmailImportBatch that produced them, so the whole
+    # batch can be identified and undone as a unit (see EmailImportBatch and
+    # /api/email-import/undo/<id> in app.py). Null for manual entries and
+    # regular Import-tab commits.
+    import_batch_id = db.Column(db.Integer, db.ForeignKey("email_import_batches.id"), nullable=True)
     # Filename of an optional attached receipt (image or PDF), stored on disk
     # under DATA_DIR/receipts/ — see app.py's receipt upload/view routes.
     # Null when no receipt has been attached.
@@ -229,6 +235,7 @@ class Transaction(db.Model):
             "created_by": self.created_by,
             "receipt_filename": self.receipt_filename,
             "is_adjustment": self.is_adjustment,
+            "import_batch_id": self.import_batch_id,
         }
 
 
@@ -249,6 +256,13 @@ class AccountReconciliation(db.Model):
     discrepancy = db.Column(db.Float, nullable=False)         # statement_balance - computed_balance
     adjustment_transaction_id = db.Column(db.Integer, db.ForeignKey("transactions.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # Set only when this reconciliation was auto-created as a side effect of
+    # an Outlook email auto-import batch (see _commit_parsed_rows in
+    # app.py) — lets Undo remove it along with the transactions it came
+    # with, instead of leaving a now-stale confirmed balance behind. Null
+    # for manual imports and for reconciliations created via the regular
+    # "Reconcile" button.
+    import_batch_id = db.Column(db.Integer, db.ForeignKey("email_import_batches.id"), nullable=True)
 
     account = db.relationship(
         "PropertyAccount", backref=db.backref(
@@ -554,12 +568,167 @@ class ImportSession(db.Model):
     handling requests across multiple worker processes/threads. Sessions
     are self-expiring — anything left over from an abandoned import gets
     cleaned up the next time someone starts a new one.
+
+    The email monitor also creates these — for a statement it found in
+    Outlook but couldn't confidently route (no matching EmailImportRule, or
+    a bundled statement where only some sub-accounts are mapped) — so the
+    person can finish the same import through the normal Import tab preview
+    screen instead of it being silently skipped. `source`/`email_subject`/
+    `email_sender`/`email_folder` are only populated for those; a normal
+    file-upload session leaves them null/"manual". `headers_json`/
+    `guess_json` let GET /api/import/session/<token> hand back the same
+    shape /api/import/preview does, so the Import tab can resume a session
+    it didn't itself just create (i.e. one the email monitor left pending)
+    without needing the original file again.
     """
     __tablename__ = "import_sessions"
 
     token = db.Column(db.String(64), primary_key=True)
     rows_json = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    source = db.Column(db.String(20), default="manual")  # "manual" | "email"
+    email_subject = db.Column(db.String(500))
+    email_sender = db.Column(db.String(255))
+    email_folder = db.Column(db.String(500))
+    suggested_property_id = db.Column(db.Integer, db.ForeignKey("properties.id"), nullable=True)
+    headers_json = db.Column(db.Text)
+    guess_json = db.Column(db.Text)
+
+
+class EmailImportRule(db.Model):
+    """Tells the Outlook email-monitor which property a bank statement
+    attachment belongs to, without a person having to look at it.
+
+    Two kinds:
+      - "folder": everything found in `folder_path` belongs to `property_id`
+        outright (one property's statements live in their own Outlook
+        folder).
+      - "subaccount": `folder_path` is the folder to watch, but the
+        statements found there bundle multiple properties' sub-accounts
+        together in one file — `match_value` is the sub-account label the
+        importer's existing bundled-statement detector already extracts
+        (see importer.py), matched case-insensitively against each row's
+        detected account, and routed to `property_id` accordingly. A folder
+        can have several "subaccount" rules, one per sub-account.
+
+    If a statement's rows don't fully resolve against these rules — no
+    matching rule at all, or a "subaccount" folder where some sub-account in
+    the file has no rule mapped to it — the whole email is left as a
+    pending review item (see ImportSession + Dashboard "needs review" alert)
+    rather than guessing or partially importing it.
+    """
+    __tablename__ = "email_import_rules"
+
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(20), nullable=False, default="folder")  # "folder" | "subaccount"
+    folder_path = db.Column(db.String(500), nullable=False)  # e.g. "Inbox\\Statements"
+    match_value = db.Column(db.String(255))  # sub-account label; null for "folder" rules
+    property_id = db.Column(db.Integer, db.ForeignKey("properties.id"), nullable=False)
+    account_label = db.Column(db.String(120), default="Imported")
+    enabled = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    property = db.relationship("Property")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "folder_path": self.folder_path,
+            "match_value": self.match_value,
+            "property_id": self.property_id,
+            "property_name": self.property.name if self.property else None,
+            "account_label": self.account_label,
+            "enabled": self.enabled,
+        }
+
+
+class EmailImportBatch(db.Model):
+    """One run of the email monitor auto-committing transactions straight
+    from an unread Outlook message, without anyone reviewing it first —
+    created only when every row in the statement resolved confidently
+    against EmailImportRule. Lets the Dashboard show "Auto-imported N
+    transactions — Undo" right after it happens, and lets that Undo action
+    find and remove exactly the rows it added (via Transaction.import_batch_id)
+    — but only while the undo window is still open (see is_undoable below).
+
+    `property_id` is left null when a single bundled statement's rows were
+    routed to more than one property via "subaccount" EmailImportRules
+    (there's no single property to attribute the whole batch to) — see
+    properties_touched()/to_dict() for how that's summarized for display.
+    """
+    __tablename__ = "email_import_batches"
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    property_id = db.Column(db.Integer, db.ForeignKey("properties.id"), nullable=True)
+    subject = db.Column(db.String(500))
+    sender = db.Column(db.String(255))
+    source_folder = db.Column(db.String(500))
+    inserted_count = db.Column(db.Integer, default=0)
+    undone = db.Column(db.Boolean, default=False)
+    undone_at = db.Column(db.DateTime)
+
+    property = db.relationship("Property")
+
+    def is_undoable(self):
+        """True only if this batch hasn't already been undone/dismissed and
+        no Transaction of ANY OTHER origin has been created since it
+        completed — the moment new data is added on top, undoing would risk
+        deleting rows the person no longer expects to lose track of, so the
+        option simply disappears.
+
+        Excludes this batch's own transactions explicitly, rather than
+        relying on created_at ordering alone — they're written in the same
+        transaction as (and can therefore land at the same instant as, or
+        even fractionally after) `self.created_at` itself, which would
+        otherwise make a batch look "already stale" the moment it's
+        created."""
+        if self.undone:
+            return False
+        newer = Transaction.query.filter(
+            Transaction.created_at > self.created_at,
+            db.or_(Transaction.import_batch_id.is_(None), Transaction.import_batch_id != self.id),
+        ).first()
+        return newer is None
+
+    def properties_touched(self):
+        """Distinct properties actually touched by this batch's Transaction
+        rows — used instead of the single `property_id` column when a
+        bundled sub-account statement spread rows across more than one
+        property."""
+        rows = (
+            db.session.query(Property.id, Property.name)
+            .join(Transaction, Transaction.property_id == Property.id)
+            .filter(Transaction.import_batch_id == self.id)
+            .distinct()
+            .all()
+        )
+        return [{"id": pid, "name": name} for pid, name in rows]
+
+    def to_dict(self):
+        touched = self.properties_touched()
+        if self.property_id and len(touched) <= 1:
+            property_name = self.property.name if self.property else None
+        elif len(touched) == 1:
+            property_name = touched[0]["name"]
+        elif len(touched) > 1:
+            property_name = f"{len(touched)} properties"
+        else:
+            property_name = None
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "property_id": self.property_id,
+            "property_name": property_name,
+            "properties_touched": touched,
+            "subject": self.subject,
+            "sender": self.sender,
+            "source_folder": self.source_folder,
+            "inserted_count": self.inserted_count,
+            "undone": self.undone,
+            "is_undoable": self.is_undoable(),
+        }
 
 
 DEFAULT_CATEGORIES = [
@@ -730,6 +899,14 @@ DEFAULT_SETTINGS = {
     # once that cap is hit, never unlimited.
     "backup_auto_frequency": "",       # "" (off) | "weekly" | "30days"
     "backup_auto_retention": "10",     # how many auto-backup .zip files to keep, 1-30
+    # Outlook email auto-import monitor (Settings > Email Auto-Import) — see
+    # email_monitor.py and the EmailImportRule/EmailImportBatch models.
+    # Requires Outlook to be running and pywin32 (Windows-only) at runtime;
+    # harmless no-op everywhere else even if left enabled. Off by default —
+    # this reaches into someone's email, so it should always be an
+    # explicit opt-in, never on by default for a fresh install.
+    "email_import_enabled": "0",
+    "email_import_poll_minutes": "15",
 }
 
 # Historical + current IRS standard business mileage rates, (effective_date,

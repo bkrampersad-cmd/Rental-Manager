@@ -50,6 +50,8 @@ from models import (
     PropertyDocument,
     DOCUMENT_TYPES,
     BackupLog,
+    EmailImportRule,
+    EmailImportBatch,
     ROLE_ADMIN,
     ROLE_EDITOR,
     ROLE_VIEWER,
@@ -66,6 +68,7 @@ from models import (
 from importer import sniff_file, build_transactions, get_ocr_status
 import exports as export_lib
 import tax_report as tax_lib
+import email_monitor
 from config import (
     load_config, save_config, get_database_url, is_server_mode,
     build_postgres_url, test_database_connection, reset_config,
@@ -2019,12 +2022,20 @@ def _apply_import_rules(text, rules_cache):
 # ---------------------------------------------------------------------------
 
 IMPORT_PREVIEW_LIMIT = 300  # rows shown/selectable in the UI; beyond this, all rows still import
-IMPORT_SESSION_TTL = timedelta(hours=2)  # abandoned imports get cleaned up after this long
+IMPORT_SESSION_TTL = timedelta(hours=2)  # abandoned manual uploads get cleaned up after this long
 
 
 def _prune_stale_import_sessions():
+    # Only prunes "manual" sessions (an upload someone started and never
+    # finished) — an email-sourced pending-review session (source="email")
+    # is meant to sit and wait on the Dashboard "needs review" alert until
+    # someone actually gets to it, which could be days, so it's deliberately
+    # exempt from this time-based cleanup. It only ever goes away by being
+    # committed or explicitly dismissed.
     cutoff = datetime.utcnow() - IMPORT_SESSION_TTL
-    ImportSession.query.filter(ImportSession.created_at < cutoff).delete()
+    ImportSession.query.filter(
+        ImportSession.created_at < cutoff, ImportSession.source != "email"
+    ).delete(synchronize_session=False)
     db.session.commit()
 
 
@@ -2062,7 +2073,10 @@ def import_preview():
     token = uuid.uuid4().hex
 
     _prune_stale_import_sessions()
-    db.session.add(ImportSession(token=token, rows_json=json.dumps(result["rows"])))
+    db.session.add(ImportSession(
+        token=token, rows_json=json.dumps(result["rows"]),
+        headers_json=json.dumps(result["headers"]), guess_json=json.dumps(result["guess"]),
+    ))
     db.session.commit()
 
     return jsonify({
@@ -2076,27 +2090,26 @@ def import_preview():
     })
 
 
-@app.route("/api/import/commit", methods=["POST"])
-@require_role(ROLE_ADMIN, ROLE_EDITOR)
-def import_commit():
-    data = request.get_json(force=True)
-    token = data.get("token")
-    mapping = data.get("mapping", {})
-    property_id = data.get("property_id")
-    default_income_cat = data.get("default_income_category_id")
-    default_expense_cat = data.get("default_expense_category_id")
-    account_label = data.get("account_label") or "Imported"
-    excluded_indices = set(data.get("excluded_row_indices") or [])
+def _commit_parsed_rows(parsed, property_id, default_income_cat=None, default_expense_cat=None,
+                         account_label="Imported", import_batch_id=None, created_by=None):
+    """Shared commit logic behind both the manual Import tab
+    (POST /api/import/commit) and the Outlook email auto-import monitor
+    (email_monitor.py). Takes rows already run through build_transactions()
+    and inserts Transaction rows for a single property, de-duping via
+    import_hash, resolving Property/Category name-column overrides (how a
+    bundled multi-sub-account statement routes different rows to different
+    properties/categories), applying ImportRule category guesses, and
+    finally auto-confirming an AccountReconciliation for every (property,
+    account label) touched, dated to the latest row seen for it.
 
-    session_row = db.session.get(ImportSession, token) if token else None
-    if not session_row:
-        return jsonify({"error": "Import session expired, please re-upload the file"}), 400
-    if not property_id:
-        return jsonify({"error": "property_id is required"}), 400
+    `import_batch_id`, when given, tags every inserted Transaction so an
+    auto-import batch can later be identified and undone as a unit — see
+    EmailImportBatch. Manual imports leave this as None.
 
-    all_rows = json.loads(session_row.rows_json)
-    rows = [r for i, r in enumerate(all_rows) if i not in excluded_indices]
-    parsed = build_transactions(rows, mapping)
+    Does NOT commit the session — the caller commits (together with
+    whatever else needs to happen in the same transaction, e.g. deleting
+    the ImportSession row)."""
+    property_id = int(property_id)
 
     # Case-insensitive lookup tables for resolving mapped Property/Category
     # name columns against what's already in the database.
@@ -2106,7 +2119,7 @@ def import_commit():
 
     existing_hashes = {
         h for (h,) in db.session.query(Transaction.import_hash)
-        .filter(Transaction.property_id == int(property_id), Transaction.import_hash.isnot(None))
+        .filter(Transaction.property_id == property_id, Transaction.import_hash.isnot(None))
         .all()
     }
 
@@ -2132,7 +2145,7 @@ def import_commit():
     for row in parsed:
         is_dupe = row["import_hash"] in existing_hashes
 
-        resolved_property_id = int(property_id)
+        resolved_property_id = property_id
         if "property_name" in row and row["property_name"]:
             match = property_by_name.get(row["property_name"].strip().lower())
             if match:
@@ -2181,7 +2194,8 @@ def import_commit():
             notes=resolved_notes,
             source="import",
             import_hash=row["import_hash"],
-            created_by=_current_username(),
+            import_batch_id=import_batch_id,
+            created_by=created_by,
         )
         db.session.add(t)
         existing_hashes.add(row["import_hash"])
@@ -2199,23 +2213,483 @@ def import_commit():
         db.session.add(AccountReconciliation(
             property_account_id=acct.id, reconcile_date=max_date,
             statement_balance=computed, computed_balance=computed, discrepancy=0.0,
+            import_batch_id=import_batch_id,
         ))
         reconciled_accounts += 1
 
-    db.session.delete(session_row)
-    db.session.commit()
-
-    return jsonify({
+    return {
         "inserted": inserted,
         "skipped_duplicates": skipped_dupes,
-        "excluded_by_user": len(excluded_indices),
-        "unparseable": len(rows) - len(parsed),
         "property_unmatched": property_unmatched,
         "category_unmatched": category_unmatched,
         "total_parsed": len(parsed),
         "rule_applied": rule_applied,
         "accounts_reconciled": reconciled_accounts,
+    }
+
+
+@app.route("/api/import/commit", methods=["POST"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def import_commit():
+    data = request.get_json(force=True)
+    token = data.get("token")
+    mapping = data.get("mapping", {})
+    property_id = data.get("property_id")
+    default_income_cat = data.get("default_income_category_id")
+    default_expense_cat = data.get("default_expense_category_id")
+    account_label = data.get("account_label") or "Imported"
+    excluded_indices = set(data.get("excluded_row_indices") or [])
+
+    session_row = db.session.get(ImportSession, token) if token else None
+    if not session_row:
+        return jsonify({"error": "Import session expired, please re-upload the file"}), 400
+    if not property_id:
+        return jsonify({"error": "property_id is required"}), 400
+
+    all_rows = json.loads(session_row.rows_json)
+    rows = [r for i, r in enumerate(all_rows) if i not in excluded_indices]
+    parsed = build_transactions(rows, mapping)
+
+    stats = _commit_parsed_rows(
+        parsed, property_id, default_income_cat, default_expense_cat,
+        account_label, created_by=_current_username(),
+    )
+
+    db.session.delete(session_row)
+    db.session.commit()
+
+    return jsonify({
+        **stats,
+        "excluded_by_user": len(excluded_indices),
+        "unparseable": len(rows) - stats["total_parsed"],
     })
+
+
+@app.route("/api/import/session/<token>", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def get_import_session(token):
+    """Lets the Import tab resume a pending session it didn't just create
+    itself — specifically, one the email monitor left for review (see
+    ImportSession.source) — without the original file. Returns the same
+    shape /api/import/preview does, so the existing preview/mapping UI can
+    be reused unchanged; the only difference is where the token came from."""
+    session_row = db.session.get(ImportSession, token)
+    if not session_row:
+        return jsonify({"error": "That import session no longer exists"}), 404
+    rows = json.loads(session_row.rows_json)
+    headers = json.loads(session_row.headers_json) if session_row.headers_json else []
+    guess = json.loads(session_row.guess_json) if session_row.guess_json else {}
+    return jsonify({
+        "token": token,
+        "headers": headers,
+        "preview_rows": rows[:IMPORT_PREVIEW_LIMIT],
+        "preview_limit": IMPORT_PREVIEW_LIMIT,
+        "row_count": len(rows),
+        "guess": guess,
+        "warnings": [],
+        "source": session_row.source,
+        "email_subject": session_row.email_subject,
+        "email_sender": session_row.email_sender,
+        "email_folder": session_row.email_folder,
+        "suggested_property_id": session_row.suggested_property_id,
+    })
+
+
+@app.route("/api/import/session/<token>", methods=["DELETE"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def dismiss_import_session(token):
+    """Dismisses a pending review item (e.g. from the Dashboard "needs
+    review" alert) without importing it — for a statement that turned out
+    not to need entering after all, or that was already handled by hand."""
+    session_row = db.session.get(ImportSession, token)
+    if session_row:
+        db.session.delete(session_row)
+        db.session.commit()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Email Auto-Import — Outlook MAPI folder monitor (Settings > Email
+# Auto-Import). email_monitor.py holds all the Outlook COM/MAPI plumbing and
+# knows nothing about Flask/the database; everything here decides what to DO
+# with what it finds — auto-commit confidently-matched rows straight to the
+# database (tagged with an EmailImportBatch so they can be undone as a unit),
+# or fall back to a normal pending ImportSession for a human to finish
+# through the Import tab, exactly like Kevin described: never guess, always
+# leave a safe, visible trail when the monitor can't be sure.
+# ---------------------------------------------------------------------------
+
+EMAIL_IMPORT_MIN_POLL_MINUTES = 5
+EMAIL_IMPORT_MAX_POLL_MINUTES = 24 * 60
+
+
+def _email_import_settings():
+    s = _settings_map()
+    try:
+        minutes = int(s.get("email_import_poll_minutes") or 15)
+    except (TypeError, ValueError):
+        minutes = 15
+    minutes = max(EMAIL_IMPORT_MIN_POLL_MINUTES, min(EMAIL_IMPORT_MAX_POLL_MINUTES, minutes))
+    return {
+        "enabled": s.get("email_import_enabled") == "1",
+        "poll_minutes": minutes,
+        "outlook_available": email_monitor.OUTLOOK_AVAILABLE,
+    }
+
+
+@app.route("/api/email-import/settings", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def get_email_import_settings():
+    return jsonify(_email_import_settings())
+
+
+@app.route("/api/email-import/settings", methods=["POST"])
+@require_role(ROLE_ADMIN)
+def update_email_import_settings():
+    data = request.get_json(force=True) or {}
+    if "enabled" in data:
+        _set_setting("email_import_enabled", "1" if data.get("enabled") else "0")
+    if "poll_minutes" in data:
+        try:
+            minutes = int(data.get("poll_minutes"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "poll_minutes must be a number"}), 400
+        minutes = max(EMAIL_IMPORT_MIN_POLL_MINUTES, min(EMAIL_IMPORT_MAX_POLL_MINUTES, minutes))
+        _set_setting("email_import_poll_minutes", str(minutes))
+    return jsonify(_email_import_settings())
+
+
+@app.route("/api/email-import/folders", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def list_email_import_folders():
+    """Lets the Settings UI offer a folder picker instead of making someone
+    type an Outlook folder path by hand. Requires Outlook to be open on
+    this machine right now — same requirement as the monitor itself."""
+    try:
+        return jsonify({"folders": email_monitor.list_folders()})
+    except email_monitor.OutlookUnavailable as exc:
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/api/email-import/rules", methods=["GET"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def list_email_import_rules():
+    rules = EmailImportRule.query.order_by(EmailImportRule.folder_path, EmailImportRule.kind).all()
+    return jsonify([r.to_dict() for r in rules])
+
+
+@app.route("/api/email-import/rules", methods=["POST"])
+@require_role(ROLE_ADMIN)
+def create_email_import_rule():
+    data = request.get_json(force=True) or {}
+    kind = data.get("kind")
+    folder_path = (data.get("folder_path") or "").strip()
+    match_value = (data.get("match_value") or "").strip() or None
+    property_id = data.get("property_id")
+    account_label = (data.get("account_label") or "").strip() or "Imported"
+
+    if kind not in ("folder", "subaccount"):
+        return jsonify({"error": "kind must be 'folder' or 'subaccount'"}), 400
+    if not folder_path:
+        return jsonify({"error": "folder_path is required"}), 400
+    if kind == "subaccount" and not match_value:
+        return jsonify({"error": "match_value is required for a sub-account rule"}), 400
+    if not property_id or not db.session.get(Property, int(property_id)):
+        return jsonify({"error": "A valid property_id is required"}), 400
+
+    rule = EmailImportRule(
+        kind=kind, folder_path=folder_path, match_value=match_value,
+        property_id=int(property_id), account_label=account_label, enabled=True,
+    )
+    db.session.add(rule)
+    db.session.commit()
+    return jsonify(rule.to_dict())
+
+
+@app.route("/api/email-import/rules/<int:rule_id>", methods=["PUT"])
+@require_role(ROLE_ADMIN)
+def update_email_import_rule(rule_id):
+    rule = db.session.get(EmailImportRule, rule_id)
+    if not rule:
+        return jsonify({"error": "Rule not found"}), 404
+    data = request.get_json(force=True) or {}
+
+    if "kind" in data:
+        if data["kind"] not in ("folder", "subaccount"):
+            return jsonify({"error": "kind must be 'folder' or 'subaccount'"}), 400
+        rule.kind = data["kind"]
+    if "folder_path" in data:
+        folder_path = (data.get("folder_path") or "").strip()
+        if not folder_path:
+            return jsonify({"error": "folder_path is required"}), 400
+        rule.folder_path = folder_path
+    if "match_value" in data:
+        rule.match_value = (data.get("match_value") or "").strip() or None
+    if "property_id" in data:
+        if not data["property_id"] or not db.session.get(Property, int(data["property_id"])):
+            return jsonify({"error": "A valid property_id is required"}), 400
+        rule.property_id = int(data["property_id"])
+    if "account_label" in data:
+        rule.account_label = (data.get("account_label") or "").strip() or "Imported"
+    if "enabled" in data:
+        rule.enabled = bool(data["enabled"])
+
+    if rule.kind == "subaccount" and not rule.match_value:
+        return jsonify({"error": "match_value is required for a sub-account rule"}), 400
+
+    db.session.commit()
+    return jsonify(rule.to_dict())
+
+
+@app.route("/api/email-import/rules/<int:rule_id>", methods=["DELETE"])
+@require_role(ROLE_ADMIN)
+def delete_email_import_rule(rule_id):
+    rule = db.session.get(EmailImportRule, rule_id)
+    if rule:
+        db.session.delete(rule)
+        db.session.commit()
+    return jsonify({"ok": True})
+
+
+def _guess_is_usable(guess):
+    """The minimum a person would need before the Import tab even shows a
+    preview: a date column, a description column, and either an amount
+    column or a debit/credit pair. Anything less and the email monitor
+    leaves this as a pending-review session rather than auto-parsing rows
+    it can't confidently line up — same as a person would have to map
+    columns by hand in that case."""
+    if not guess:
+        return False
+    has_amount = (
+        guess.get("amount_col") is not None
+        or guess.get("debit_col") is not None
+        or guess.get("credit_col") is not None
+    )
+    return guess.get("date_col") is not None and guess.get("description_col") is not None and has_amount
+
+
+def _create_pending_email_session(folder_path, subject, sender, rows, headers, guess, suggested_property_id=None):
+    _prune_stale_import_sessions()
+    token = uuid.uuid4().hex
+    db.session.add(ImportSession(
+        token=token, rows_json=json.dumps(rows),
+        headers_json=json.dumps(headers), guess_json=json.dumps(guess or {}),
+        source="email", email_subject=(subject or "")[:500], email_sender=(sender or "")[:255],
+        email_folder=folder_path, suggested_property_id=suggested_property_id,
+    ))
+    db.session.commit()
+    return token
+
+
+def _process_email_item(item, filename, raw, folder_path, rules_for_folder):
+    """Decides what to do with one unread email's statement attachment:
+    auto-commit it (tagged to an EmailImportBatch) if every row resolves
+    confidently against `rules_for_folder`, otherwise leave it as a pending
+    ImportSession for the Import tab. Always marks the email read once
+    handled either way — but only once handled, so a crash partway through
+    leaves it unread and retried on the next poll instead of silently lost."""
+    subject, sender = email_monitor.message_metadata(item)
+
+    try:
+        result = sniff_file(filename, raw)
+    except Exception:
+        app.logger.exception("Email auto-import: could not read attachment %r", filename)
+        _create_pending_email_session(folder_path, subject, sender, [], [], {})
+        email_monitor.mark_read(item)
+        return
+
+    headers = result.get("headers") or []
+    rows = result.get("rows") or []
+    guess = result.get("guess") or {}
+
+    if not headers or not rows or not _guess_is_usable(guess):
+        _create_pending_email_session(folder_path, subject, sender, rows, headers, guess)
+        email_monitor.mark_read(item)
+        return
+
+    parsed = build_transactions(rows, guess)
+    if not parsed:
+        _create_pending_email_session(folder_path, subject, sender, rows, headers, guess)
+        email_monitor.mark_read(item)
+        return
+
+    folder_rule = next((r for r in rules_for_folder if r.kind == "folder"), None)
+    subaccount_rules = {
+        r.match_value.strip().lower(): r
+        for r in rules_for_folder if r.kind == "subaccount" and r.match_value
+    }
+
+    groups = {}  # property_id -> {"rule": EmailImportRule, "rows": [...]}
+    if folder_rule:
+        groups[folder_rule.property_id] = {"rule": folder_rule, "rows": parsed}
+    elif subaccount_rules:
+        for row in parsed:
+            key = (row.get("account") or "").strip().lower()
+            rule = subaccount_rules.get(key)
+            if not rule:
+                groups = None
+                break
+            groups.setdefault(rule.property_id, {"rule": rule, "rows": []})["rows"].append(row)
+    else:
+        groups = None
+
+    if not groups:
+        # No rule covers this folder at all, or (for a bundled sub-account
+        # statement) at least one row's account wasn't mapped — the whole
+        # email goes to review rather than importing some rows and not
+        # others, which would be a confusing half-done state.
+        _create_pending_email_session(folder_path, subject, sender, rows, headers, guess)
+        email_monitor.mark_read(item)
+        return
+
+    batch = EmailImportBatch(
+        property_id=next(iter(groups)) if len(groups) == 1 else None,
+        subject=(subject or "")[:500], sender=(sender or "")[:255], source_folder=folder_path,
+    )
+    db.session.add(batch)
+    db.session.flush()  # assign batch.id for _commit_parsed_rows to tag rows with
+
+    total_inserted = 0
+    for property_id, group in groups.items():
+        rule = group["rule"]
+        stats = _commit_parsed_rows(
+            group["rows"], property_id, account_label=(rule.account_label or "Imported"),
+            import_batch_id=batch.id,
+        )
+        total_inserted += stats["inserted"]
+    batch.inserted_count = total_inserted
+    db.session.commit()
+    email_monitor.mark_read(item)
+
+
+def _poll_email_import_once():
+    """One full pass: connects to Outlook, checks every folder that has at
+    least one enabled EmailImportRule, and processes every unread item in
+    it with a supported attachment. Any failure (Outlook not open, a folder
+    that no longer exists, a single bad email) is caught and logged rather
+    than raised, so one bad folder or a closed Outlook never stops the rest
+    of the pass or crashes the scheduler — exactly the same
+    try/except-and-move-on approach already used for scheduled auto-backups."""
+    rules = EmailImportRule.query.filter_by(enabled=True).all()
+    if not rules:
+        return
+
+    rules_by_folder = {}
+    for r in rules:
+        rules_by_folder.setdefault(r.folder_path, []).append(r)
+
+    ns = email_monitor.outlook_namespace()  # raises OutlookUnavailable if not reachable
+
+    for folder_path, folder_rules in rules_by_folder.items():
+        try:
+            folder = email_monitor.resolve_folder(ns, folder_path)
+        except ValueError:
+            app.logger.warning("Email auto-import: folder no longer found: %r", folder_path)
+            continue
+        try:
+            for item, filename, raw in email_monitor.unread_items_with_attachment(folder):
+                try:
+                    _process_email_item(item, filename, raw, folder_path, folder_rules)
+                except Exception:
+                    app.logger.exception(
+                        "Email auto-import: failed processing an item in %r", folder_path
+                    )
+        except email_monitor.OutlookUnavailable:
+            raise
+        except Exception:
+            app.logger.exception("Email auto-import: failed reading folder %r", folder_path)
+
+
+_email_scheduler_started = False
+
+
+def _email_scheduler_loop():
+    time.sleep(20)  # let the app finish booting/migrating first
+    while True:
+        next_sleep_seconds = 300  # fallback if reading settings itself fails
+        try:
+            with app.app_context():
+                settings = _email_import_settings()
+                next_sleep_seconds = settings["poll_minutes"] * 60
+                if settings["enabled"]:
+                    _poll_email_import_once()
+        except email_monitor.OutlookUnavailable:
+            pass  # Outlook isn't open right now — perfectly normal, try again next time
+        except Exception:
+            app.logger.exception("Scheduled email auto-import check failed")
+        time.sleep(next_sleep_seconds)
+
+
+def _start_email_scheduler():
+    global _email_scheduler_started
+    if _email_scheduler_started:
+        return
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+    _email_scheduler_started = True
+    threading.Thread(target=_email_scheduler_loop, daemon=True).start()
+
+
+_start_email_scheduler()
+
+
+@app.route("/api/email-import/poll-now", methods=["POST"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def poll_email_import_now():
+    """Manual "Check now" button in Settings — runs one poll pass
+    immediately instead of waiting for the scheduled interval, mainly so a
+    newly-added rule can be tried right away."""
+    try:
+        _poll_email_import_once()
+    except email_monitor.OutlookUnavailable as exc:
+        return jsonify({"error": str(exc)}), 503
+    return jsonify({"ok": True})
+
+
+@app.route("/api/email-import/pending", methods=["GET"])
+def list_pending_email_imports():
+    """Powers the Dashboard "N statements need review" alert — every
+    ImportSession the email monitor left behind because it couldn't
+    confidently route it on its own."""
+    rows = ImportSession.query.filter_by(source="email").order_by(ImportSession.created_at.asc()).all()
+    return jsonify([{
+        "token": r.token,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "email_subject": r.email_subject,
+        "email_sender": r.email_sender,
+        "email_folder": r.email_folder,
+        "suggested_property_id": r.suggested_property_id,
+    } for r in rows])
+
+
+@app.route("/api/email-import/batches", methods=["GET"])
+def list_email_import_batches():
+    """Recent auto-import batches — used for the Dashboard's "Auto-imported
+    N transactions — Undo" notification (only the most recent undoable one
+    is shown; see EmailImportBatch.is_undoable)."""
+    limit = min(int(request.args.get("limit", 10)), 50)
+    rows = EmailImportBatch.query.order_by(EmailImportBatch.created_at.desc()).limit(limit).all()
+    return jsonify([b.to_dict() for b in rows])
+
+
+@app.route("/api/email-import/undo/<int:batch_id>", methods=["POST"])
+@require_role(ROLE_ADMIN, ROLE_EDITOR)
+def undo_email_import_batch(batch_id):
+    batch = db.session.get(EmailImportBatch, batch_id)
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+    if not batch.is_undoable():
+        return jsonify({
+            "error": "This import can no longer be undone — either it already was, or new data "
+                     "has been added since it ran."
+        }), 400
+
+    AccountReconciliation.query.filter_by(import_batch_id=batch.id).delete(synchronize_session=False)
+    Transaction.query.filter_by(import_batch_id=batch.id).delete(synchronize_session=False)
+    batch.undone = True
+    batch.undone_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -2415,6 +2889,43 @@ def dashboard_alerts():
             "property_name": prop.name,
             "message": f"{(d.original_filename or d.filename)} ({d.doc_type}) at {prop.name} "
                        f"expires {d.expiration_date}.",
+        })
+
+    # 5) Statements the Email Auto-Import monitor found but couldn't
+    # confidently route on its own — each one is sitting as a pending
+    # ImportSession, ready to be finished in the Import tab (see
+    # GET /api/import/session/<token> and /api/email-import/pending).
+    pending_email_count = ImportSession.query.filter_by(source="email").count()
+    if pending_email_count:
+        alerts.append({
+            "severity": "warning",
+            "type": "email_import_review",
+            "property_id": None,
+            "message": (
+                f"{pending_email_count} bank statement"
+                f"{'s' if pending_email_count != 1 else ''} from email need{'s' if pending_email_count == 1 else ''} review "
+                "before they can be imported."
+            ),
+        })
+
+    # 6) The most recent Outlook auto-import batch, for as long as it's
+    # still safe to undo (see EmailImportBatch.is_undoable) — disappears on
+    # its own the moment any newer transaction is added, exactly like Kevin
+    # asked for, no separate "dismiss" needed for it to go away naturally.
+    latest_batch = (
+        EmailImportBatch.query.filter_by(undone=False)
+        .order_by(EmailImportBatch.created_at.desc()).first()
+    )
+    if latest_batch and latest_batch.is_undoable():
+        b = latest_batch.to_dict()
+        where = f" for {b['property_name']}" if b["property_name"] else ""
+        alerts.append({
+            "severity": "info",
+            "type": "email_import_undo",
+            "property_id": latest_batch.property_id,
+            "batch_id": latest_batch.id,
+            "message": f"Auto-imported {b['inserted_count']} transaction"
+                       f"{'s' if b['inserted_count'] != 1 else ''}{where} from email.",
         })
 
     return jsonify(alerts)
@@ -3494,10 +4005,12 @@ def _factory_reset_data_only():
     RecurringTransaction.query.delete()
     ImportRule.query.delete()
     Transaction.query.delete()
+    EmailImportBatch.query.delete()
+    EmailImportRule.query.delete()
+    ImportSession.query.delete()
     PropertyUnit.query.delete()
     PropertyAccount.query.delete()
     Property.query.delete()
-    ImportSession.query.delete()
     Category.query.delete()
     db.session.commit()
 

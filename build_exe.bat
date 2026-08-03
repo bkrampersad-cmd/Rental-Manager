@@ -54,6 +54,10 @@ pyinstaller --noconfirm --name RentalManager ^
     --add-data "LICENSE;." ^
     --add-data "migrations;migrations" ^
     --hidden-import "logging.config" ^
+    --hidden-import "win32com.client" ^
+    --hidden-import "win32timezone" ^
+    --hidden-import "pythoncom" ^
+    --hidden-import "pywintypes" ^
     %TESSERACT_FLAG% ^
     launcher.py
 

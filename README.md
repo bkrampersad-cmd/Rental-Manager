@@ -63,6 +63,7 @@ See [Setup](#-setup) below for running from source instead, or the PDF guide for
 - Manual entry, or bulk **import from CSV, Excel, or PDF** bank statements — full column mapping, row/column exclusion, and automatic duplicate detection on re-import.
 - Scanned/photographed PDF statements are read via **OCR** (the app tells you plainly when OCR was used, so you know to double-check).
 - **Import auto-categorization rules** — teach the importer a payee once, and future imports categorize themselves.
+- **Email Auto-Import (Windows + Outlook)** — watches specific Outlook folders for unread bank statement attachments and imports them automatically; confidently-matched statements commit straight to the database (with a Dashboard **Undo**), anything less certain is left as a **Needs Review** item on the Import tab instead of being guessed at.
 - **Recurring transactions** — set up rent, mortgage payments, or subscriptions once; they generate on schedule automatically.
 
 ### 🧾 Tax & Reporting
@@ -74,7 +75,7 @@ See [Setup](#-setup) below for running from source instead, or the PDF guide for
 ### 🏡 Tenants & Documents
 - **Tenants & leases** — names, unit assignments, lease dates, and monthly rent per property.
 - **Property documents** — store leases, insurance policies, and other files against a property, with expiration-date tracking.
-- **Dashboard alerts** — proactive nudges for unreconciled accounts, quiet properties, and expiring leases/documents.
+- **Dashboard alerts** — proactive nudges for unreconciled accounts, quiet properties, expiring leases/documents, and statements from Email Auto-Import waiting for review.
 - **Global search** — one search box finds properties, transactions, and tenants at once.
 
 ### 🎨 Branding & Customization
@@ -180,6 +181,7 @@ app.py                    Flask app, API routes, setup wizard, login, role enfor
 models.py                 Database models (properties, transactions, categories, settings, users)
 config.py                 Standalone-vs-server mode config (see docs/multi-user-server-mode-plan.md)
 importer.py               CSV/Excel/PDF statement parsing, OCR fallback, & column auto-detection
+email_monitor.py          Outlook MAPI/COM helpers for Email Auto-Import (Windows + Outlook only)
 exports.py                CSV / Excel / PDF generation, incl. business letterhead branding
 launcher.py               Entry point — standalone (dev server + browser) or server mode (Waitress)
 migrations/               Database schema migrations (Flask-Migrate/Alembic) — applied automatically on startup
