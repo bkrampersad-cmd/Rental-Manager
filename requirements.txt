@@ -22,6 +22,12 @@ pytesseract>=0.3.10
 # skips this line) even though the app itself only ships for Windows.
 pywin32>=306; sys_platform == "win32"
 
+# System tray icon shown when the packaged .exe runs in Standalone mode with
+# its console window hidden (see launcher.py) — gives you a way to reopen
+# the app or quit it without a visible console. Windows-only for the same
+# reason as pywin32 above; skipped harmlessly everywhere else.
+pystray>=0.19.5; sys_platform == "win32"
+
 # Server mode's PostgreSQL driver is intentionally NOT listed here — see
 # requirements-server.txt. It's only needed if you actually connect to
 # Postgres or build the distributable installer (build_exe.bat installs

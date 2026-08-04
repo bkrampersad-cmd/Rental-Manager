@@ -9,6 +9,9 @@ if not exist venv (
 )
 call venv\Scripts\activate.bat
 
+echo Checking for pip updates...
+python -m pip install -q --upgrade pip
+
 echo Installing dependencies...
 pip install -q -r requirements.txt
 pip install -q -r requirements-server.txt
@@ -53,11 +56,16 @@ pyinstaller --noconfirm --name RentalManager ^
     --add-data "static;static" ^
     --add-data "LICENSE;." ^
     --add-data "migrations;migrations" ^
+    --add-data "assets;assets" ^
     --hidden-import "logging.config" ^
     --hidden-import "win32com.client" ^
     --hidden-import "win32timezone" ^
     --hidden-import "pythoncom" ^
     --hidden-import "pywintypes" ^
+    --hidden-import "win32api" ^
+    --hidden-import "win32event" ^
+    --hidden-import "winerror" ^
+    --hidden-import "pystray._win32" ^
     %TESSERACT_FLAG% ^
     launcher.py
 
