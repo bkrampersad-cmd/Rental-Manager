@@ -1,0 +1,403 @@
+RENTAL PROPERTY MANAGER — BUILD FROM SCRATCH INSTRUCTIONS
+============================================================
+Everything needed to go from just this project's files to a
+working app (or a distributable RentalManagerSetup.exe) on a
+brand-new Windows computer, written for someone who has never set
+this project up before and is starting with nothing but the files
+in this folder — no bundled installers included here (if you have
+"Build From Scratch.zip" instead, that copy also bundles the
+Python/Inno Setup/Tesseract installers in a Software\ folder, so
+you can skip the download links below and just run those).
+
+Last updated: August 2026 (Version 2.1)
+
+
+WHAT'S IN THIS FOLDER
+------------------------------------------------------------
+This is the full project source — every file needed to run the
+app from source OR build a distributable installer. It does NOT
+include:
+  - A virtual environment (venv) — you create this yourself, see
+    below. Never copy someone else's venv folder between
+    computers; always build a fresh one on the machine you're
+    using.
+  - Any installers for Python, Inno Setup, or Tesseract OCR — see
+    the download links below.
+  - Any database, test data, logos, or receipts — a brand-new
+    empty database is created automatically the first time the
+    app runs.
+  - Any previous build output (build\, dist\, installer_output\)
+    — running the build scripts creates these from scratch, and
+    it's safe to delete them yourself at any time too.
+
+
+WHAT YOU NEED TO DOWNLOAD AND INSTALL FIRST
+------------------------------------------------------------
+1. Python (required) — 3.9 or newer. Download and run the
+   installer from:
+       https://www.python.org/downloads/
+   On the very first install screen, check the box
+   "Add python.exe to PATH" — easy to miss, and every step below
+   assumes it's checked. If you skip it, `python` won't be
+   recognized in a Command Prompt and you'll need to either
+   reinstall with that box checked or add Python to your PATH
+   manually afterward.
+
+2. Inno Setup (optional) — only needed if you want to build
+   RentalManagerSetup.exe yourself (Option B below). Not needed
+   just to run the app from source (Option A). Download from:
+       https://jrsoftware.org/isdl.php
+   Click through the installer with defaults; nothing to
+   configure.
+
+3. Tesseract OCR (optional) — only needed if you plan to import
+   SCANNED or PHOTOGRAPHED PDF bank statements. A normal digital
+   PDF statement (the kind where you can select and copy the
+   text) is read directly and works fine without this. If
+   Tesseract isn't installed, the app just tells you plainly that
+   OCR isn't available instead of failing silently or crashing —
+   everything else keeps working. Community-maintained Windows
+   build (UB-Mannheim), download the latest 64-bit installer from:
+       https://github.com/UB-Mannheim/tesseract/wiki
+   Default install location and options are fine. You can also
+   bundle Tesseract right into the app you build, so the people
+   you hand RentalManagerSetup.exe to don't need to install it
+   themselves at all — see "BUNDLING TESSERACT OCR INTO THE APP
+   ITSELF" further below.
+
+4. PostgreSQL (optional) — only needed if you plan to actually
+   run/test "Network mode" (a shared install for a team) locally,
+   rather than just building an installer that supports it (the
+   installer supports Network mode either way). Download from the
+   official Windows installer page:
+       https://www.postgresql.org/download/windows/
+   See docs\deployment-guide.md for the full walkthrough (Postgres
+   setup, keeping a server running unattended, firewall rules,
+   user accounts/roles).
+
+Nothing else needs to be installed manually. Every Python package
+this project needs (Flask, PyInstaller, pywin32, etc.) is
+installed automatically by pip in the steps below, into its own
+isolated virtual environment (see next section) so none of it
+touches or conflicts with anything else already on the computer.
+
+
+WHAT A VIRTUAL ENVIRONMENT (venv) IS, AND WHY THIS PROJECT USES ONE
+------------------------------------------------------------
+A virtual environment is a private, self-contained copy of Python
+just for this one project — its own folder (named venv\ here)
+holding its own copies of every package the project needs (Flask,
+PyInstaller, and so on), completely separate from whatever else is
+installed on your computer's main/system Python.
+
+Why bother: without one, installing this project's packages would
+install them globally, which can silently upgrade or downgrade a
+package another project on the same computer already depends on,
+causing that other project to break in a way that's confusing to
+track down later. A venv makes this project's dependencies
+disposable and self-contained — if anything goes wrong, you can
+just delete the venv\ folder and rebuild it from nothing (see
+"Manual setup" below), instead of untangling a shared global
+Python install.
+
+You never create or manage it directly — run.bat, run.sh, and
+build_exe.bat all create venv\ automatically the first time you
+run them (skipping that step on every run after) and install this
+project's packages into it. It's completely safe to delete the
+venv\ folder at any time; the next run.bat/build_exe.bat just
+rebuilds it from scratch, and none of your actual data (which
+lives in data\, not venv\) is ever touched by that.
+
+
+OPTION A — JUST RUN THE APP FROM SOURCE (no installer)
+------------------------------------------------------------
+Fastest way to try it out, or to develop/test changes.
+
+Windows:
+  1. Make sure Python is installed (see above).
+  2. Double-click run.bat in this folder.
+     This creates the virtual environment (venv\) the first time,
+     installs requirements.txt into it, and starts the app.
+  3. A browser window opens automatically at
+     http://localhost:5000
+  4. The first time it runs, you'll see a one-time setup screen —
+     choose "Just me on this computer" for the normal single-user
+     experience.
+
+Mac/Linux (for development only — the installer this project
+builds is Windows-only, and Email Auto-Import / the system tray
+icon only work on Windows either way):
+  1. Open a terminal in this folder.
+  2. Run: ./run.sh
+
+Manual setup (any OS, if you want to see/control each step
+yourself instead of letting run.bat do it):
+  python -m venv venv
+  venv\Scripts\activate            (Windows)
+  source venv/bin/activate         (Mac/Linux)
+  pip install -r requirements.txt
+  python launcher.py
+
+Your data lives in data\rental_manager.db once you run it this
+way. Back that file up periodically, or use Settings -> Backup &
+Restore inside the app (which also supports an automatic backup
+schedule — see the User Manual PDF in docs\).
+
+
+OPTION B — BUILD THE WINDOWS INSTALLER (.exe) TO HAND OUT
+------------------------------------------------------------
+This produces a single RentalManagerSetup.exe that anyone can run
+to install the app — no Python, no command line, no admin rights
+required on their end.
+
+Steps:
+  1. Make sure Python and Inno Setup are both installed (see
+     download links above).
+  2. Double-click build_exe.bat.
+     This will:
+       - create a virtual environment (venv\) if one doesn't
+         already exist
+       - check for and quietly install any pip update itself
+       - pip install requirements.txt (core dependencies)
+       - pip install requirements-server.txt (the PostgreSQL
+         driver — needed so the built exe supports Network mode
+         too, even if you personally only use Standalone mode)
+       - pip install pyinstaller
+       - freeze everything into dist\RentalManager\
+         RentalManager.exe
+     This takes a few minutes the first time (downloading packages
+     + freezing the app). Subsequent runs are faster.
+  3. Double-click build_installer.bat.
+     This compiles installer.iss with Inno Setup into
+     installer_output\RentalManagerSetup.exe — a single file that
+     bundles the app, the LICENSE, the Install Guide PDF, and the
+     User Manual PDF.
+  4. Hand installer_output\RentalManagerSetup.exe to anyone.
+     Running it installs to their own user folder (no admin rights
+     needed), adds a Start Menu entry ("Rental Property Manager",
+     including shortcuts to the User Manual, Install Guide, and
+     License) and an optional desktop shortcut, and includes an
+     uninstaller.
+
+Nothing needs to be cleared out before building — a data\ folder
+(if present from your own local testing) is never bundled into
+the exe. Each installed copy creates its own empty database the
+first time it runs.
+
+TROUBLESHOOTING build_exe.bat:
+  If pip install -r requirements-server.txt fails with an error
+  mentioning "pg_config not found" or "Microsoft Visual C++ 14.0
+  required", it means this computer's Python version is newer than
+  what the current psycopg2-binary release on PyPI has a
+  precompiled wheel for yet (it tends to lag a few months behind
+  new Python releases). If you hit this:
+    a) Install a slightly older Python version confirmed to have a
+       psycopg2-binary wheel (check
+       https://pypi.org/project/psycopg2-binary/ for what's
+       currently supported) alongside your current one, and build
+       with that instead, OR
+    b) Bump the version pin in requirements-server.txt once a
+       newer psycopg2-binary release adds a wheel for your Python
+       version.
+  This only affects Network mode / building the installer — it
+  never affects Option A (running from source), since run.bat
+  deliberately doesn't install this file.
+
+TROUBLESHOOTING build_installer.bat:
+  "Inno Setup was not found in the usual install locations" means
+  Inno Setup isn't installed yet (see download link above), or
+  open installer.iss directly in the Inno Setup Compiler app and
+  click Build instead of using the .bat file.
+
+
+BUNDLING TESSERACT OCR INTO THE APP ITSELF (OPTIONAL)
+------------------------------------------------------------
+Normally, OCR (for scanned/photographed PDF statements) needs
+Tesseract installed separately on whatever machine runs the app.
+You can skip that requirement entirely by baking Tesseract's
+program files into RentalManagerSetup.exe instead, so it works out
+of the box for whoever you hand the installer to — no separate
+install, nothing for them to do. This is optional and adds roughly
+40-50 MB to the installer size; skip it if that's not worth it to
+you.
+
+The app's code (importer.py) already looks for this automatically
+— nothing to configure in Settings, and nothing breaks if you skip
+this section. It just checks for a tesseract-bin\ folder next to
+the app at startup: if it's there, OCR uses those bundled files;
+if not, it falls back to a separate system-wide Tesseract install
+exactly as before.
+
+To set it up:
+  1. Install Tesseract OCR once on your Windows machine (see
+     download link above). Default install location is
+     C:\Program Files\Tesseract-OCR.
+  2. Copy that entire folder into this project as tesseract-bin\
+     (i.e., you should end up with tesseract-bin\tesseract.exe,
+     tesseract-bin\*.dll, and a tesseract-bin\tessdata\ folder
+     containing at least eng.traineddata).
+  3. Also worth copying in: the LICENSE file from that same
+     Tesseract install folder — Tesseract is Apache License 2.0,
+     which permits redistribution as long as the license notice
+     travels with it. Put it at tesseract-bin\LICENSE-tesseract.txt
+     or similar so it's included but doesn't collide with this
+     project's own LICENSE file.
+  4. Run build_exe.bat as normal. It detects tesseract-bin\
+     automatically and prints a line confirming it's bundling it;
+     if you don't see that line, double check the folder name and
+     that tesseract.exe is directly inside it (not nested another
+     level deeper).
+  5. Run build_installer.bat as normal — no changes needed there;
+     it already copies everything PyInstaller produced, including
+     tesseract-bin\, into the installer.
+
+If you only want OCR for your own use rather than bundling it for
+everyone you hand the installer to, it's simpler to just install
+Tesseract normally (step 1 above) and skip the rest of this
+section — the app already picks up a system-wide install fine,
+with nothing extra to configure.
+
+
+EMAIL AUTO-IMPORT — WHAT IT NEEDS (NO EXTRA DOWNLOAD)
+------------------------------------------------------------
+Settings -> Email Auto-Import watches specific Outlook folders for
+unread emails carrying a bank statement attachment and imports
+them automatically. This talks to Microsoft Outlook via Windows
+COM automation, so it only works on Windows, and only when Outlook
+is installed, configured with a mail account, and actually
+running. There's nothing to download or bundle for this yourself —
+Outlook is a separate Microsoft product this project doesn't
+include or install, and the Python side of it (the pywin32
+package) is already installed automatically by
+pip install -r requirements.txt on Windows (skipped automatically
+on Mac/Linux, where the feature simply isn't available).
+
+Two things worth knowing:
+  - Nothing about this ever probes Outlook on its own. Opening
+    Settings, or the app in general, touches nothing — it only
+    connects to Outlook when you click "Discover Outlook Folders"
+    in that Settings card, or when the scheduled background check
+    is both enabled AND has at least one folder/sub-account rule
+    configured. This is deliberate: simply calling into Outlook's
+    COM interface (even just to list folders) can trigger Outlook's
+    own first-run "Set Up Outlook" wizard on a machine where
+    Outlook is installed but has never had a mail account
+    configured, so this feature is opt-in only.
+  - If Outlook isn't open when a scheduled check runs, it just
+    waits and tries again next time — nothing breaks, nothing else
+    in the app is affected.
+
+
+THE STANDALONE APP'S CONSOLE WINDOW, SYSTEM TRAY ICON, AND SINGLE-INSTANCE CHECK
+------------------------------------------------------------
+The built .exe hides its console window at startup (instead of
+leaving a black command-prompt window open behind the browser tab)
+and shows a small icon in the system tray (near the clock) instead,
+with "Open Rental Property Manager" and "Quit" — Quit is how you
+fully stop the app; closing the browser tab alone does not (the
+app keeps running quietly in the background until Quit is chosen,
+same as before, just without a visible window as the reminder).
+This needs the pystray package, which pip already installs
+automatically from requirements.txt on Windows (skipped elsewhere,
+same as pywin32). If, for any reason, pystray or the app's icon
+file can't be loaded when the app starts, it falls back to the
+original visible-console behavior automatically — nothing is ever
+left running invisibly with no way to close it.
+
+Launching the app again while a copy is already running (easy to
+do without noticing now that its console is hidden) does not start
+a second server against the same database — it detects the
+already-running copy (a Windows named mutex) and just reopens the
+browser to it instead. This only applies to the packaged Windows
+.exe.
+
+
+WHERE THINGS END UP ONCE INSTALLED (for your reference)
+------------------------------------------------------------
+- App install location (Standalone or Network mode):
+  %LOCALAPPDATA%\Programs\Rental Property Manager\
+  (a per-user folder — no admin rights needed to install or run)
+- Data (Standalone mode — SQLite database, logos, receipts,
+  documents, and the Backup folder for scheduled automatic
+  backups):
+  %LOCALAPPDATA%\RentalManager\data\
+  %LOCALAPPDATA%\Programs\Rental Property Manager\Backup\
+- Start Menu: "Rental Property Manager" group, with entries for
+  the app itself, User Manual, Install Guide, License, and
+  Uninstall.
+- Desktop shortcut: optional, offered during install.
+
+
+NETWORK MODE (SHARED TEAM INSTALL)
+------------------------------------------------------------
+The same installer and the same build steps above cover Network
+mode too — which mode a given install runs as is chosen on the
+first-run setup screen, not a separate build. If you're setting up
+a shared install pointing at a PostgreSQL database instead of a
+single person's local file, see docs\deployment-guide.md for the
+full walkthrough (Postgres setup, keeping the server running
+unattended, firewall rules, user accounts/roles).
+
+
+IF A PASSWORD IS EVER FORGOTTEN
+------------------------------------------------------------
+- Standalone mode: click "Forgot password?" on the lock screen and
+  answer any one of the 3 security questions set up in Settings.
+  If all 3 answers are also forgotten, reset_access_password.py
+  (included with the app) clears the password and security
+  questions directly from the database file, as a last resort.
+- Network mode: any other Admin can reset a locked-out user's
+  password in two clicks via Settings -> Users. If every Admin is
+  locked out at once, reset_admin_password.py (included with the
+  app) resets one directly against the Postgres database.
+
+
+PROJECT STRUCTURE (for reference)
+------------------------------------------------------------
+app.py                    Flask app, API routes, setup wizard,
+                           login, role enforcement
+models.py                 Database models
+config.py                 Standalone-vs-server mode config
+importer.py                CSV/Excel/PDF statement parsing, OCR
+                           fallback, column auto-detection
+email_monitor.py           Outlook MAPI/COM helpers for Email
+                           Auto-Import (Windows + Outlook only)
+exports.py                 CSV / Excel / PDF generation
+depreciation.py             Schedule E depreciation calculations
+tax_report.py               1099/tax document report generation
+launcher.py                 Entry point (dev server + browser +
+                             tray icon, or Waitress for server mode)
+migrations\                 Database schema migrations (applied
+                             automatically on startup)
+templates\                  HTML templates (main app, setup
+                             wizard, login, unlock screen)
+static\                     CSS/JS/image assets for the web UI
+assets\app_icon.ico         App icon — embedded into the .exe and
+                             installer, and used by the system tray
+                             icon, by build_exe.bat / installer.iss
+tesseract-bin\              Optional, not included by default — add
+                             this yourself to bundle Tesseract OCR
+                             into the build (see "BUNDLING
+                             TESSERACT OCR INTO THE APP ITSELF"
+                             above)
+docs\                        Deployment guide, server-mode planning
+                             notes, Install Guide PDF, User Manual
+                             PDF
+LICENSE / LICENSE.md         Proprietary license, free use/no
+                             modification/no redistribution
+reset_access_password.py     Last-resort Standalone recovery tool
+reset_admin_password.py      Last-resort Network mode recovery tool
+requirements.txt              Core dependencies (Flask, pywin32,
+                               pystray, etc.)
+requirements-server.txt       PostgreSQL driver (server mode /
+                               installer builds only)
+run.bat / run.sh               Quick dev-mode preview, no build step
+build_exe.bat                  Freezes the app with PyInstaller
+build_installer.bat            Compiles the Inno Setup installer
+installer.iss                  Inno Setup script (installer
+                               contents, shortcuts, Finish-page
+                               options)
+
+
+---
+Created by Beeran Rampersad · Built with the assistance of Claude AI

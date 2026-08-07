@@ -74,6 +74,144 @@ def comparison_to_csv(rows):
 
 
 # ---------------------------------------------------------------------------
+# QuickBooks / Quicken migration exports — IIF (QuickBooks Desktop), QIF
+# (Quicken), and a plain 3-column bank CSV (QuickBooks Online's manual bank
+# transaction upload, also accepted by Quicken's CSV importer). These exist
+# so someone who decides to move to one of those platforms can bring their
+# transaction history with them instead of re-keying it by hand. Amount sign
+# convention throughout: positive = income/deposit, negative = expense/
+# payment — matching how a real bank register works.
+# ---------------------------------------------------------------------------
+
+def _iif_safe(text):
+    """IIF is tab-delimited; strip anything that would break a column."""
+    if not text:
+        return ""
+    return str(text).replace("\t", " ").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _qif_safe(text):
+    """QIF fields are one per line; strip newlines that would break that."""
+    if not text:
+        return ""
+    return str(text).replace("\n", " ").replace("\r", " ").strip()
+
+
+def _reformat_date(iso_date):
+    try:
+        return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    except (ValueError, TypeError):
+        return iso_date or ""
+
+
+def transactions_to_iif(transactions):
+    """QuickBooks Desktop IIF file. Creates one BANK account per distinct
+    property/account-label pair, one INC or EXP account per category, and one
+    CLASS per property (turn on class tracking in QuickBooks — Edit >
+    Preferences > Accounting — to get a per-property P&L from these), then a
+    balanced TRNS/SPL/ENDTRNS block per transaction. For a deposit, the bank
+    leg is positive and the income leg is the same amount negative; for a
+    check/payment it's the reverse — this is what keeps each transaction
+    balanced on import."""
+    bank_accounts = {}   # (property_name, account_label) -> IIF account name
+    category_types = {}  # IIF category account name -> "income"/"expense"
+    classes = []
+    rows = []
+
+    def bank_account_name(property_name, account_label):
+        key = (property_name, account_label or "")
+        if key not in bank_accounts:
+            label = account_label or "Bank Account"
+            name = f"{property_name} - {label}" if property_name else label
+            bank_accounts[key] = _iif_safe(name)[:100] or "Bank Account"
+        return bank_accounts[key]
+
+    for t in transactions:
+        prop = t.get("property_name") or ""
+        if prop and prop not in classes:
+            classes.append(prop)
+        bank_name = bank_account_name(prop, t.get("account"))
+        cat_name = _iif_safe(t.get("category_name") or "Uncategorized")[:100] or "Uncategorized"
+        category_types[cat_name] = t["type"]
+        rows.append((t, bank_name, cat_name, prop))
+
+    lines = ["!ACCNT\tNAME\tACCNTTYPE"]
+    for name in sorted(set(bank_accounts.values())):
+        lines.append(f"ACCNT\t{name}\tBANK")
+    for cat_name in sorted(category_types):
+        acct_type = "INC" if category_types[cat_name] == "income" else "EXP"
+        lines.append(f"ACCNT\t{cat_name}\t{acct_type}")
+
+    if classes:
+        lines.append("!CLASS\tNAME")
+        for c in classes:
+            lines.append(f"CLASS\t{_iif_safe(c)}")
+
+    lines.append("!TRNS\tTRNSID\tTRNSTYPE\tDATE\tACCNT\tNAME\tCLASS\tAMOUNT\tMEMO")
+    lines.append("!SPL\tSPLID\tTRNSTYPE\tDATE\tACCNT\tNAME\tCLASS\tAMOUNT\tMEMO")
+    lines.append("!ENDTRNS")
+
+    for t, bank_name, cat_name, prop in rows:
+        qb_date = _reformat_date(t["date"])
+        payee = _iif_safe(t.get("payee"))
+        memo = _iif_safe(t.get("notes"))
+        amount = t["amount"]
+        is_income = t["type"] == "income"
+        trns_type = "DEPOSIT" if is_income else "CHECK"
+        trns_amount = amount if is_income else -amount
+        spl_amount = -amount if is_income else amount
+        class_field = _iif_safe(prop)
+        lines.append(f"TRNS\t\t{trns_type}\t{qb_date}\t{bank_name}\t{payee}\t{class_field}\t{trns_amount:.2f}\t{memo}")
+        lines.append(f"SPL\t\t{trns_type}\t{qb_date}\t{cat_name}\t{payee}\t{class_field}\t{spl_amount:.2f}\t{memo}")
+        lines.append("ENDTRNS")
+
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def transactions_to_qif(transactions):
+    """Quicken QIF file — a single !Type:Bank register. Each transaction's
+    category (and, via Quicken's Category/Class syntax, its property) is
+    preserved, so nothing needs to be re-categorized by hand after
+    importing."""
+    lines = ["!Type:Bank"]
+    for t in sorted(transactions, key=lambda x: x["date"]):
+        qdate = _reformat_date(t["date"])
+        amount = t["amount"] if t["type"] == "income" else -t["amount"]
+        payee = t.get("payee") or (t.get("category_name") or "Transaction")
+        category = t.get("category_name") or "Uncategorized"
+        prop = t.get("property_name") or ""
+        lines.append(f"D{qdate}")
+        lines.append(f"T{amount:.2f}")
+        lines.append(f"P{_qif_safe(payee)}")
+        cat_field = f"{_qif_safe(category)}/{_qif_safe(prop)}" if prop else _qif_safe(category)
+        lines.append(f"L{cat_field}")
+        notes = t.get("notes")
+        if notes:
+            lines.append(f"M{_qif_safe(notes)}")
+        lines.append("^")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def transactions_to_qb_csv(transactions):
+    """Plain 3-column Date/Description/Amount CSV — the format QuickBooks
+    Online's manual bank-transaction upload expects, and one Quicken's CSV
+    importer also accepts. Categories aren't preserved (neither target
+    column layout carries them) — use the IIF or QIF export instead if
+    keeping categories intact matters more than QuickBooks Online
+    compatibility specifically."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Description", "Amount"])
+    for t in sorted(transactions, key=lambda x: x["date"]):
+        csv_date = _reformat_date(t["date"])
+        bits = [b for b in [t.get("payee"), t.get("property_name")] if b]
+        description = " - ".join(bits) if bits else (t.get("category_name") or "Transaction")
+        amount = t["amount"] if t["type"] == "income" else -t["amount"]
+        writer.writerow([csv_date, description, f"{amount:.2f}"])
+    return buf.getvalue().encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Excel
 # ---------------------------------------------------------------------------
 

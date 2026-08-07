@@ -2056,8 +2056,8 @@ def import_preview():
         return jsonify({"error": "No file uploaded"}), 400
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
-    if ext not in ("csv", "xlsx", "xlsm", "pdf"):
-        return jsonify({"error": "Unsupported file type. Use a .csv, .xlsx, or .pdf file."}), 400
+    if ext not in ("csv", "xlsx", "xlsm", "pdf", "iif", "qif"):
+        return jsonify({"error": "Unsupported file type. Use a .csv, .xlsx, .pdf, .iif, or .qif file."}), 400
 
     raw = file.read()
     try:
@@ -2117,11 +2117,27 @@ def _commit_parsed_rows(parsed, property_id, default_income_cat=None, default_ex
     categories = Category.query.all()
     category_by_name = {(c.name.strip().lower(), c.type): c.id for c in categories}
 
-    existing_hashes = {
-        h for (h,) in db.session.query(Transaction.import_hash)
-        .filter(Transaction.property_id == property_id, Transaction.import_hash.isnot(None))
-        .all()
-    }
+    # Deduping is scoped per-property (loaded lazily, one query per property
+    # actually touched) rather than one flat set for the whole import. A
+    # bundled multi-property statement/ledger — which is exactly what a
+    # QuickBooks/Quicken migration file usually is — routes different rows
+    # to different resolved properties via the Property-name override below,
+    # so checking every row against only the caller's single default
+    # property_id would miss real duplicates on rows that resolved to a
+    # different property, letting a re-import silently double them up.
+    # Keeping it per-property (rather than one global set) still protects
+    # against two different properties coincidentally having a genuinely
+    # distinct transaction that happens to hash the same.
+    _hash_cache = {}
+
+    def _hashes_for(pid):
+        if pid not in _hash_cache:
+            _hash_cache[pid] = {
+                h for (h,) in db.session.query(Transaction.import_hash)
+                .filter(Transaction.property_id == pid, Transaction.import_hash.isnot(None))
+                .all()
+            }
+        return _hash_cache[pid]
 
     import_rules = ImportRule.query.all()
 
@@ -2143,15 +2159,18 @@ def _commit_parsed_rows(parsed, property_id, default_income_cat=None, default_ex
     account_max_date = {}
 
     for row in parsed:
-        is_dupe = row["import_hash"] in existing_hashes
-
         resolved_property_id = property_id
+        property_matched = True
         if "property_name" in row and row["property_name"]:
             match = property_by_name.get(row["property_name"].strip().lower())
             if match:
                 resolved_property_id = match
-            elif not is_dupe:
-                property_unmatched += 1
+            else:
+                property_matched = False
+
+        is_dupe = row["import_hash"] in _hashes_for(resolved_property_id)
+        if not property_matched and not is_dupe:
+            property_unmatched += 1
 
         resolved_account = row.get("account") or account_label
         date_key = (resolved_property_id, resolved_account)
@@ -2198,7 +2217,7 @@ def _commit_parsed_rows(parsed, property_id, default_income_cat=None, default_ex
             created_by=created_by,
         )
         db.session.add(t)
-        existing_hashes.add(row["import_hash"])
+        _hashes_for(resolved_property_id).add(row["import_hash"])
         inserted += 1
 
     reconciled_accounts = 0
@@ -3213,6 +3232,48 @@ def export_comparison(fmt):
                           download_name=f"{fname_base}.pdf")
     else:
         abort(400)
+
+
+@app.route("/api/export/quickbooks.<fmt>", methods=["GET"])
+def export_quickbooks(fmt):
+    """One-time/occasional migration export — brings transaction history
+    (with categories, and property tagged as a QuickBooks Class / Quicken
+    sub-category) into QuickBooks Desktop (.iif), Quicken (.qif), or a
+    generic 3-column bank CSV that QuickBooks Online's manual upload and
+    Quicken's CSV importer both accept. Unlike /api/export/transactions.<fmt>
+    above, this deliberately has no type/category/unit filters — a
+    migration should bring everything, not just what happens to be on
+    screen — but still respects a property and date-range choice since not
+    everyone migrating wants every property or all history at once."""
+    if fmt not in ("iif", "qif", "csv"):
+        abort(400)
+
+    property_id = request.args.get("property_id", "all")
+    start = request.args.get("start")
+    end = request.args.get("end")
+
+    txns = _query_transactions(property_id=property_id, start=start, end=end)
+    txn_dicts = [_txn_dict_with_property(t) for t in txns]
+
+    if property_id != "all":
+        prop = db.session.get(Property, int(property_id))
+        prop_slug = (prop.name if prop else "property").replace(" ", "_")
+    else:
+        prop_slug = "all_properties"
+    fname_base = f"{prop_slug}_{date.today().isoformat()}"
+
+    if fmt == "iif":
+        content = export_lib.transactions_to_iif(txn_dicts)
+        return send_file(io.BytesIO(content), mimetype="application/octet-stream", as_attachment=True,
+                          download_name=f"quickbooks_{fname_base}.iif")
+    elif fmt == "qif":
+        content = export_lib.transactions_to_qif(txn_dicts)
+        return send_file(io.BytesIO(content), mimetype="application/qif", as_attachment=True,
+                          download_name=f"quicken_{fname_base}.qif")
+    else:  # csv
+        content = export_lib.transactions_to_qb_csv(txn_dicts)
+        return send_file(io.BytesIO(content), mimetype="text/csv", as_attachment=True,
+                          download_name=f"bank_transactions_{fname_base}.csv")
 
 
 # ---------------------------------------------------------------------------

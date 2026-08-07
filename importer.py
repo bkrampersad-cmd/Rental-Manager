@@ -577,7 +577,220 @@ def sniff_file(filename, file_bytes):
         return sniff_xlsx(file_bytes)
     if ext == "pdf":
         return sniff_pdf(file_bytes)
+    if ext == "iif":
+        return sniff_iif(file_bytes)
+    if ext == "qif":
+        return sniff_qif(file_bytes)
     return sniff_csv(file_bytes)
+
+
+# ---------------------------------------------------------------------------
+# QuickBooks Desktop (.iif) and Quicken (.qif) — for migrating IN from one
+# of those platforms, the reverse of the exports in exports.py. Both parsers
+# below produce the exact same {headers, rows, guess, row_count, warnings}
+# shape sniff_csv/sniff_xlsx/sniff_pdf return, with every column already
+# correctly guessed (there's no ambiguity to resolve — these are structured
+# formats, not freeform bank exports) — so the existing column-mapping
+# preview screen, build_transactions(), and _commit_parsed_rows() in app.py
+# all work completely unchanged; the user just gets a mapping screen that's
+# already filled in correctly, and can still adjust it before importing.
+# ---------------------------------------------------------------------------
+
+_IIF_ROW_HEADERS = ["Date", "Payee", "Category", "Property (Class)", "Amount", "Type", "Memo", "Bank Account"]
+_QIF_ROW_HEADERS = ["Date", "Payee", "Category", "Property (Class)", "Amount", "Type", "Memo"]
+
+
+def _structured_guess(headers):
+    """Column-guess mapping for the fixed, always-in-this-order columns
+    _IIF_ROW_HEADERS/_QIF_ROW_HEADERS produce above."""
+    idx = {h: i for i, h in enumerate(headers)}
+    return {
+        "date_col": idx.get("Date"),
+        "description_col": idx.get("Payee"),
+        "amount_col": idx.get("Amount"),
+        "debit_col": None,
+        "credit_col": None,
+        "property_col": idx.get("Property (Class)"),
+        "category_col": idx.get("Category"),
+        "type_col": idx.get("Type"),
+        "account_col": idx.get("Bank Account"),
+        "notes_col": idx.get("Memo"),
+    }
+
+
+def sniff_iif(file_bytes):
+    """Reads a QuickBooks Desktop IIF export's bank-register transactions
+    (TRNS/SPL/ENDTRNS blocks) — the kind produced by exporting a specific
+    bank account's register, which is what exports.py's own IIF export
+    also produces, and what QuickBooks Desktop itself writes when you
+    export a register or transaction list. Reads any TRNSTYPE (DEPOSIT,
+    CHECK, PAYMENT, GENERAL JOURNAL, etc.) the same way, using plain
+    double-entry sign logic rather than special-casing each type: whichever
+    line is the TRNS line is treated as the bank/cash side (its ACCNT
+    becomes the row's "Bank Account", its sign decides income vs. expense),
+    and the first SPL line is treated as the category side. A transaction
+    split across more than one SPL line only keeps the first split's
+    category — the rest of that split's amount isn't lost (it's still part
+    of the total), but its own separate categorization is, so those rows
+    are flagged in a warning for a manual double-check after importing.
+    Invoice/bill/estimate detail elsewhere in a full company-file IIF
+    export (anything outside a TRNS/SPL/ENDTRNS block) is ignored — this
+    only reads actual cash-basis bank transactions, matching what this app
+    tracks."""
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    n = len(lines)
+
+    trns_cols = None
+    spl_cols = None
+    blocks = []
+    multi_split_count = 0
+
+    i = 0
+    while i < n:
+        parts = lines[i].split("\t")
+        tag = parts[0].strip() if parts else ""
+        if tag == "!TRNS":
+            trns_cols = parts
+            i += 1
+        elif tag == "!SPL":
+            spl_cols = parts
+            i += 1
+        elif tag == "TRNS":
+            trns_fields = dict(zip(trns_cols, parts)) if trns_cols else {}
+            spl_fields_list = []
+            j = i + 1
+            while j < n:
+                jparts = lines[j].split("\t")
+                jtag = jparts[0].strip() if jparts else ""
+                if jtag == "SPL":
+                    spl_fields_list.append(dict(zip(spl_cols, jparts)) if spl_cols else {})
+                    j += 1
+                elif jtag == "ENDTRNS":
+                    j += 1
+                    break
+                else:
+                    break  # malformed block — stop scanning rather than misreading unrelated lines
+            i = j
+            if len(spl_fields_list) > 1:
+                multi_split_count += 1
+            blocks.append((trns_fields, spl_fields_list))
+        else:
+            i += 1
+
+    rows = []
+    for trns_fields, spl_fields_list in blocks:
+        try:
+            amount = float((trns_fields.get("AMOUNT") or "0").replace(",", ""))
+        except ValueError:
+            amount = 0.0
+        first_spl = spl_fields_list[0] if spl_fields_list else {}
+        category = first_spl.get("ACCNT", "")
+        prop = trns_fields.get("CLASS", "") or first_spl.get("CLASS", "")
+        rows.append([
+            trns_fields.get("DATE", ""),
+            trns_fields.get("NAME", ""),
+            category,
+            prop,
+            f"{abs(amount):.2f}",
+            "income" if amount >= 0 else "expense",
+            trns_fields.get("MEMO", ""),
+            trns_fields.get("ACCNT", ""),
+        ])
+
+    warnings = []
+    if not rows:
+        warnings.append(
+            "No bank transactions (TRNS/SPL blocks) were found in this IIF file. Make sure it's a "
+            "register or transaction-list export for one bank account, not a full company-file backup."
+        )
+    if multi_split_count:
+        warnings.append(
+            f"{multi_split_count} transaction(s) in this file were split across more than one category "
+            "— only the first category of each was kept here; the total amount is still correct, but "
+            "double-check those rows' categories after importing."
+        )
+
+    return {
+        "headers": _IIF_ROW_HEADERS,
+        "rows": rows[:5000],
+        "guess": _structured_guess(_IIF_ROW_HEADERS),
+        "row_count": len(rows),
+        "warnings": warnings,
+    }
+
+
+def sniff_qif(file_bytes):
+    """Reads a Quicken QIF register export (!Type:Bank / !Type:Cash /
+    !Type:CCard, then D/T/P/L/M/^ records per transaction). Understands the
+    Category/Class syntax (an L line like "Rent Income/123 Main St") that
+    this app's own QIF export uses to carry a transaction's property along
+    — but reads a plain Quicken-generated QIF (no "/Class" part) exactly as
+    well, it just leaves the property column blank for those rows so the
+    mapping screen's normal "guess property from payee" fallback can take
+    over instead."""
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+
+    records = []
+    cur = {}
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        if not line or line.startswith("!"):
+            continue  # blank line, or a !Type:... header — not transaction data
+        code, rest = line[0], line[1:]
+        if code == "^":
+            if cur:
+                records.append(cur)
+            cur = {}
+        elif code in ("T", "U"):
+            cur["amount"] = rest.strip()
+        elif code == "D":
+            cur["date"] = rest.strip()
+        elif code == "P":
+            cur["payee"] = rest.strip()
+        elif code == "L":
+            if "/" in rest:
+                cat, cls = rest.split("/", 1)
+            else:
+                cat, cls = rest, ""
+            cur["category"] = cat.strip()
+            cur["property"] = cls.strip()
+        elif code == "M":
+            cur["memo"] = rest.strip()
+        elif code == "N" and "memo" not in cur:
+            cur["memo"] = rest.strip()  # check/reference number — kept only if there's no real memo
+        # other codes (C cleared status, A address lines, S/E splits, etc.) intentionally ignored
+    if cur:  # tolerate a file missing its final "^" terminator
+        records.append(cur)
+
+    rows = []
+    for r in records:
+        try:
+            amount = float((r.get("amount") or "0").replace(",", ""))
+        except ValueError:
+            amount = 0.0
+        rows.append([
+            r.get("date", ""),
+            r.get("payee", ""),
+            r.get("category", ""),
+            r.get("property", ""),
+            f"{abs(amount):.2f}",
+            "income" if amount >= 0 else "expense",
+            r.get("memo", ""),
+        ])
+
+    warnings = []
+    if not rows:
+        warnings.append("No transactions were found in this QIF file.")
+
+    return {
+        "headers": _QIF_ROW_HEADERS,
+        "rows": rows[:5000],
+        "guess": _structured_guess(_QIF_ROW_HEADERS),
+        "row_count": len(rows),
+        "warnings": warnings,
+    }
 
 
 def _looks_numeric(v):

@@ -61,6 +61,7 @@ See [Setup](#-setup) below for running from source instead, or the PDF guide for
 
 ### 💳 Transactions & Import
 - Manual entry, or bulk **import from CSV, Excel, or PDF** bank statements — full column mapping, row/column exclusion, and automatic duplicate detection on re-import.
+- **Import from QuickBooks (.iif) or Quicken (.qif)** — moving from either platform brings its categories and payees straight in, auto-matched to your existing properties by name.
 - Scanned/photographed PDF statements are read via **OCR** (the app tells you plainly when OCR was used, so you know to double-check).
 - **Import auto-categorization rules** — teach the importer a payee once, and future imports categorize themselves.
 - **Email Auto-Import (Windows + Outlook)** — watches specific Outlook folders for unread bank statement attachments and imports them automatically; confidently-matched statements commit straight to the database (with a Dashboard **Undo**), anything less certain is left as a **Needs Review** item on the Import tab instead of being guessed at.
@@ -71,6 +72,7 @@ See [Setup](#-setup) below for running from source instead, or the PDF guide for
 - **Mileage tracker** — log property-related trips (optionally tagged to a specific unit); deductions calculate at the current IRS standard mileage rate and flow into your tax report automatically.
 - **Property comparison** — cap rate, cash-on-cash return, income, expenses, and net cash flow, side by side for any subset of properties you pick.
 - **Exports** to CSV, Excel (formatted, color-coded), or a polished letterhead-branded PDF — and a **Print** button on Dashboard/Transactions/Compare for a clean printed page.
+- **Migrate to QuickBooks or Quicken** — export your full transaction history as a QuickBooks Desktop IIF (with matching accounts and a Class per property), a Quicken QIF (categories + property preserved), or a generic bank CSV for QuickBooks Online's manual upload.
 
 ### 🏡 Tenants & Documents
 - **Tenants & leases** — names, unit assignments, lease dates, and monthly rent per property.
